@@ -1,0 +1,27 @@
+[33mcommit 1f19390aafb49f8cf4d62bdc12b83966732e653b[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m)[m
+Author: Suvam Suryakanta Nayak <nayaksuvamsuryakanta@gmail.com>
+Date:   Fri Oct 30 20:27:09 2026 +0530
+
+    Day 1: HoloForge project scaffolding
+
+ .gitignore                     |  27 [32m+++++++++++[m
+ README.md                      | 107 [32m+++++++++++++++++++++++++++++++++++++++++[m
+ assets/models/.gitkeep         |   1 [32m+[m
+ models/.gitkeep                |   1 [32m+[m
+ output/.gitkeep                |   1 [32m+[m
+ requirements.txt               |   6 [32m+++[m
+ scripts/setup_windows.bat      |  70 [32m+++++++++++++++++++++++++++[m
+ setup.cfg                      |  18 [32m+++++++[m
+ src/__init__.py                |  12 [32m+++++[m
+ src/analysis/__init__.py       |   5 [32m++[m
+ src/analysis/model_analyzer.py |  66 [32m+++++++++++++++++++++++++[m
+ src/main.py                    |  36 [32m++++++++++++++[m
+ src/rendering/__init__.py      |   5 [32m++[m
+ src/rendering/projection_3d.py |  79 [32m++++++++++++++++++++++++++++++[m
+ src/utils/__init__.py          |   9 [32m++++[m
+ src/utils/helpers.py           |  60 [32m+++++++++++++++++++++++[m
+ src/vision/__init__.py         |   5 [32m++[m
+ src/vision/hand_tracker.py     |  78 [32m++++++++++++++++++++++++++++++[m
+ tests/__init__.py              |   1 [32m+[m
+ tests/test_placeholder.py      |  44 [32m+++++++++++++++++[m
+ 20 files changed, 631 insertions(+)
