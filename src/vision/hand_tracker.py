@@ -41,9 +41,9 @@ FRAME_HEIGHT = 480
 # that a hand is only reported when all three gates agree.
 MIN_CONFIDENCE = 0.7
 
-# Hands tracked per frame. The landmarker returns the most confident hand
-# first, which keeps the single-hand HUD unambiguous.
-NUM_HANDS = 1
+# Hands tracked per frame. The landmarker returns the most confident hands
+# first, which is what lets the 3D engine drive two-hand zoom/pan.
+NUM_HANDS = 2
 
 # Landmark indices used by the geometry helpers. MediaPipe hands are 21
 # points ordered wrist, thumb, index, middle, ring, pinky.
@@ -218,8 +218,8 @@ class HandTracker:
 
     def detect(
         self, frame_bgr: np.ndarray, timestamp_ms: int
-    ) -> Optional[List[NormalizedLandmark]]:
-        """Detect hands in a single BGR frame and return the top hand.
+    ) -> Optional[List[List[NormalizedLandmark]]]:
+        """Detect hands in a single BGR frame and return every hand found.
 
         Parameters
         ----------
@@ -231,16 +231,16 @@ class HandTracker:
 
         Returns
         -------
-        list[NormalizedLandmark] | None
-            21 normalised landmarks of the most confident hand, or ``None``
-            when no hand is present.
+        list[list[NormalizedLandmark]] | None
+            One 21-normalised-landmark list per detected hand, most confident
+            first, or ``None`` when no hand is present.
         """
         rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         result = self.landmarker.detect_for_video(image, timestamp_ms)
         if not result.hand_landmarks:
             return None
-        return result.hand_landmarks[0]
+        return result.hand_landmarks
 
     def get_pinch_ratio(
         self, landmarks: Optional[List[NormalizedLandmark]]
@@ -304,10 +304,50 @@ class HandTracker:
             return None
         return self._point(landmarks, LANDMARK_MIDDLE_MCP)
 
+    def get_two_hand_stats(
+        self, hands: Optional[List[List[NormalizedLandmark]]]
+    ) -> Optional[dict]:
+        """Return the midpoint and span of a two-hand configuration.
+
+        The midpoint is the mean of the two palm centres and the span is the
+        Euclidean distance between them. Together they drive two-hand zoom
+        (span ratio) and pan (midpoint delta).
+
+        Parameters
+        ----------
+        hands : list[list[NormalizedLandmark]] | None
+            One normalised landmark list per hand, as returned by
+            :meth:`detect`.
+
+        Returns
+        -------
+        dict | None
+            ``{"midpoint": (x, y), "span": distance, "num_hands": 2}`` in
+            normalised image coordinates, or ``None`` when fewer than two
+            hands are detected.
+        """
+        if hands is None or len(hands) < 2:
+            return None
+
+        first_palm = self._point(hands[0], LANDMARK_MIDDLE_MCP)
+        second_palm = self._point(hands[1], LANDMARK_MIDDLE_MCP)
+        if first_palm is None or second_palm is None:
+            return None
+
+        midpoint = tuple(
+            (first_palm[axis] + second_palm[axis]) / 2.0 for axis in range(2)
+        )
+        span = float(
+            np.linalg.norm(np.asarray(first_palm) - np.asarray(second_palm))
+        )
+        return {"midpoint": midpoint, "span": span, "num_hands": 2}
+
     def draw_skeleton(
-        self, frame_bgr: np.ndarray, landmarks: Optional[List[NormalizedLandmark]]
+        self,
+        frame_bgr: np.ndarray,
+        hands: Optional[List[List[NormalizedLandmark]]],
     ) -> np.ndarray:
-        """Draw the hand skeleton and landmarks onto a copy of the frame.
+        """Draw every hand's skeleton and landmarks onto a copy of the frame.
 
         Bone connections are rendered in green and each landmark in yellow.
         Normalised coordinates are scaled to the frame dimensions before
@@ -317,8 +357,9 @@ class HandTracker:
         ----------
         frame_bgr : np.ndarray
             ``(height, width, 3)`` BGR image to annotate.
-        landmarks : list[NormalizedLandmark] | None
-            Normalised landmarks returned by ``detect``.
+        hands : list[list[NormalizedLandmark]] | None
+            One normalised landmark list per hand, as returned by
+            :meth:`detect`.
 
         Returns
         -------
@@ -326,34 +367,35 @@ class HandTracker:
             A new frame carrying the skeleton overlay, or an unannotated
             copy when no hand was detected.
         """
-        if landmarks is None:
+        if hands is None:
             return frame_bgr.copy()
 
         height, width = frame_bgr.shape[:2]
         drawing = frame_bgr.copy()
 
-        for start, end in HAND_CONNECTIONS:
-            first = self._scaled(landmarks, start, width, height)
-            second = self._scaled(landmarks, end, width, height)
-            if first is not None and second is not None:
-                cv2.line(
-                    drawing,
-                    first,
-                    second,
-                    SKELETON_LINE_COLOR,
-                    SKELETON_LINE_THICKNESS,
-                )
+        for landmarks in hands:
+            for start, end in HAND_CONNECTIONS:
+                first = self._scaled(landmarks, start, width, height)
+                second = self._scaled(landmarks, end, width, height)
+                if first is not None and second is not None:
+                    cv2.line(
+                        drawing,
+                        first,
+                        second,
+                        SKELETON_LINE_COLOR,
+                        SKELETON_LINE_THICKNESS,
+                    )
 
-        for index in range(len(landmarks)):
-            point = self._scaled(landmarks, index, width, height)
-            if point is not None:
-                cv2.circle(
-                    drawing,
-                    point,
-                    SKELETON_POINT_RADIUS,
-                    SKELETON_POINT_COLOR,
-                    -1,
-                )
+            for index in range(len(landmarks)):
+                point = self._scaled(landmarks, index, width, height)
+                if point is not None:
+                    cv2.circle(
+                        drawing,
+                        point,
+                        SKELETON_POINT_RADIUS,
+                        SKELETON_POINT_COLOR,
+                        -1,
+                    )
 
         return drawing
 

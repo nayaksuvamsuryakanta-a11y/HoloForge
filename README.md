@@ -61,10 +61,14 @@ holoforge/
 │   ├── main.py              # Logging-based CLI entry point
 │   ├── vision/              # Camera capture + hand landmark detection
 │   │   ├── __init__.py
-│   │   └── hand_tracker.py
-│   ├── rendering/           # 3D projection + pygame visualization
+│   │   └── hand_tracker.py  # Landmarker, pinch grab, palm smoothing, two-hand stats
+│   ├── rendering/           # 3D projection + wireframe rendering
 │   │   ├── __init__.py
-│   │   └── projection_3d.py
+│   │   ├── projection_3d.py    # Pinhole projection, rotation, cube geometry
+│   │   └── wireframe_renderer.py  # Single-pass OpenCV edge drawing
+│   ├── interaction/         # Gesture-driven model interaction
+│   │   ├── __init__.py
+│   │   └── gesture_controller.py  # Grab-rotate, spin-and-catch, two-hand zoom/pan
 │   ├── analysis/            # Latency and accuracy profiling
 │   │   ├── __init__.py
 │   │   └── model_analyzer.py
@@ -73,7 +77,9 @@ holoforge/
 │       └── helpers.py
 ├── tests/
 │   ├── __init__.py
-│   └── test_placeholder.py
+│   ├── test_placeholder.py
+│   ├── test_projection.py      # Geometry: rotation, projection, cube
+│   └── test_gesture_controller.py  # State machine: grab, spin, catch, hysteresis
 ├── assets/models/           # Imported .stl / .obj mesh files
 │   └── .gitkeep
 ├── output/                  # Rendered frames and profiling reports
@@ -92,13 +98,30 @@ holoforge/
 
 | Week | Goal | Deliverables |
 |------|------|--------------|
-| **1** | Capture a live camera feed and detect hand landmarks | `HandTracker.start()` wired to MediaPipe, live preview window |
-| **2** | Project landmarks into a 3D scene | `Projection3D` matrix chain, pygame rendering surface |
+| **1** | Capture a live camera feed and detect hand landmarks | `HandTracker` wired to MediaPipe `HandLandmarker`, live preview window, pinch grab + palm smoothing |
+| **2** | Project landmarks into a 3D scene and drive them with gestures | `rotation_matrix` / `make_cube` / `project_points`, `WireframeRenderer`, `GestureController` (grab-rotate, spin-and-catch, two-hand zoom/pan), keyboard fallback, unit tests |
 | **3** | Recognize gestures and commands | Gesture vocabulary, `ModelAnalyzer` accuracy metrics |
 | **4** | Polish and integrate | Voice commands, profiling dashboard, README walkthrough |
 
-Status: **Day 1** - project scaffolding complete. All modules are stubs that
-raise `NotImplementedError` until the corresponding week's work is wired up.
+Status: **Day 10** - Week 1 and Week 2 implemented. The 3D wireframe engine
+and gesture interaction layer are complete and covered by unit tests; Weeks 3
+and 4 are not yet started.
+
+---
+
+## Controls
+
+| Action | Input | Behaviour |
+|--------|-------|-----------|
+| Grab-rotate | Pinch and drag one hand | Model rotates with the palm; velocity is set from the frame-to-frame palm delta |
+| Release-spin | Open the hand while dragging | Model keeps spinning; velocity decays frame-rate-independently with time constant `TAU` |
+| Catch | Re-pinch a spinning model | Velocity is re-sourced from the current hand motion so the model follows the hand immediately |
+| Two-hand zoom | Move two hands apart / together | Model scale tracks the palm-span ratio, clamped to `0.5x`-`3.0x` |
+| Two-hand pan | Drag two hands together | Model pans with the palm midpoint |
+| Keyboard fallback | Arrow keys | Rotate `5` degrees per press |
+| Keyboard fallback | `+` / `-` | Scale up / down by `0.1`, clamped to `0.5x`-`3.0x` |
+| Reset | `r` | Return rotation, scale and offset to their defaults |
+| Exit | `ESC` | Close the window |
 
 ---
 
