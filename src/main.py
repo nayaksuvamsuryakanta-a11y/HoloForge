@@ -38,6 +38,7 @@ HUD_BACKGROUND = (20, 20, 40)  # BGR dark blue-gray
 # Per-line HUD colours for the gesture state indicator.
 HUD_STATE_IDLE_COLOR = (0, 255, 0)    # BGR green
 HUD_STATE_GRAB_COLOR = (0, 0, 255)    # BGR red
+HUD_STATE_HOLD_COLOR = (0, 165, 255)  # BGR amber, used while a hand is lost
 
 # FPS estimation ------------------------------------------------------------
 # Weight given to the previous smoothed value; a high smoothing factor keeps
@@ -209,14 +210,18 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
             ]
             colors = [HUD_TEXT_COLOR, HUD_TEXT_COLOR, HUD_TEXT_COLOR, state_colour]
         else:
-            # No hand: the gesture state holds its last value and the HUD
-            # stays identical to Day 2 so the exit path is unchanged.
+            # No hand: the detectors keep their last value so a hand that
+            # leaves and returns resumes from the previous state instead of
+            # resetting. The State line stays visible, coloured amber to
+            # signal that the reading is stale.
+            state_text = "State: GRABBED" if grab_detector.is_grabbed else "State: IDLE"
             lines = [
                 f"FPS: {smoothed_fps:.1f}",
                 "Pinch: N/A",
                 "No hand detected",
+                state_text,
             ]
-            colors = None
+            colors = [HUD_TEXT_COLOR, HUD_TEXT_COLOR, HUD_TEXT_COLOR, HUD_STATE_HOLD_COLOR]
 
         draw_hud(overlay, lines, colors)
         cv2.imshow(WINDOW_NAME, overlay)
