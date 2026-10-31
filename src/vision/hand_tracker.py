@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     # ``detect``; mediapipe ships this generated proto alongside the runtime.
     from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark
 
-__all__ = ["HandTracker"]
+__all__ = ["GrabDetector", "HandTracker", "Smoother"]
 
 # MediaPipe hand-landmarker bundle. Kept relative so the model can live
 # anywhere under the workspace; ``scripts/setup_windows.bat`` populates it.
@@ -87,6 +87,76 @@ SKELETON_LINE_COLOR = (0, 255, 0)  # BGR green
 SKELETON_LINE_THICKNESS = 2
 SKELETON_POINT_COLOR = (0, 255, 255)  # BGR yellow
 SKELETON_POINT_RADIUS = 3
+
+# Grab gesture thresholds, expressed in pinch-ratio units.
+GRAB_THRESHOLD = 0.35   # below this the hand is considered grabbed
+RELEASE_THRESHOLD = 0.50  # above this the hand is considered released
+# Values between the two thresholds hold the previous state, giving the
+# hysteresis band that stops noise from toggling the gesture repeatedly.
+
+# Smoothing applied to scalar streams (pinch ratio, palm position).
+SMOOTHING_ALPHA = 0.2
+
+
+class Smoother:
+    """Exponential moving average filter for a single scalar stream.
+
+    Each call blends the new sample toward the running value by
+    ``SMOOTHING_ALPHA``; a low alpha favours stability over responsiveness,
+    which is what keeps a tracked palm position from jittering frame to frame.
+    """
+
+    def __init__(self, initial: float = 0.0) -> None:
+        """Seed the filter with an initial value.
+
+        Parameters
+        ----------
+        initial : float, default ``0.0``
+            Starting value of the running average.
+        """
+        self._value = initial
+
+    def update(self, value: float) -> float:
+        """Blend ``value`` into the running average and return the result."""
+        self._value += SMOOTHING_ALPHA * (value - self._value)
+        return self._value
+
+
+class GrabDetector:
+    """Hysteretic grab state machine driven by a pinch ratio.
+
+    Closing the thumb below ``GRAB_THRESHOLD`` grabs, and opening back above
+    ``RELEASE_THRESHOLD`` releases; values in between hold the previous state
+    so that noise around the boundary cannot toggle it repeatedly.
+    """
+
+    def __init__(self) -> None:
+        """Start in the released state."""
+        self._grabbed = False
+
+    def update(self, pinch_ratio: float) -> bool:
+        """Advance the state machine and return the new grabbed state.
+
+        Parameters
+        ----------
+        pinch_ratio : float
+            Current thumb-to-index gap, normalised by hand size.
+
+        Returns
+        -------
+        bool
+            True if the hand is now grabbed, False otherwise.
+        """
+        if not self._grabbed and pinch_ratio < GRAB_THRESHOLD:
+            self._grabbed = True
+        elif self._grabbed and pinch_ratio > RELEASE_THRESHOLD:
+            self._grabbed = False
+        return self._grabbed
+
+    @property
+    def is_grabbed(self) -> bool:
+        """True while the hand is currently holding a grab."""
+        return self._grabbed
 
 
 class HandTracker:

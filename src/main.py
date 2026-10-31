@@ -15,7 +15,7 @@ from typing import Optional
 import cv2
 
 from src.utils.helpers import setup_logging
-from src.vision.hand_tracker import HandTracker
+from src.vision.hand_tracker import GrabDetector, HandTracker, Smoother
 
 __all__ = ["main"]
 
@@ -34,6 +34,10 @@ HUD_FONT_SCALE = 0.55
 HUD_FONT_THICKNESS = 1
 HUD_TEXT_COLOR = (220, 220, 220)  # BGR light gray
 HUD_BACKGROUND = (20, 20, 40)  # BGR dark blue-gray
+
+# Per-line HUD colours for the gesture state indicator.
+HUD_STATE_IDLE_COLOR = (0, 255, 0)    # BGR green
+HUD_STATE_GRAB_COLOR = (0, 0, 255)    # BGR red
 
 # FPS estimation ------------------------------------------------------------
 # Weight given to the previous smoothed value; a high smoothing factor keeps
@@ -88,7 +92,11 @@ def open_webcam() -> cv2.VideoCapture:
     )
 
 
-def draw_hud(frame: np.ndarray, lines: list[str]) -> None:
+def draw_hud(
+    frame: np.ndarray,
+    lines: list[str],
+    colors: Optional[list[tuple[int, int, int]]] = None,
+) -> None:
     """Render a block of status text into the top-left corner of ``frame``.
 
     A dark backing rectangle is drawn first so the text stays legible over
@@ -100,6 +108,10 @@ def draw_hud(frame: np.ndarray, lines: list[str]) -> None:
         ``(height, width, 3)`` BGR image to annotate.
     lines : list[str]
         Status strings, rendered top to bottom in the order given.
+    colors : list[tuple[int, int, int]] | None, default ``None``
+        Per-line BGR text colours. If ``None`` every line uses
+        ``HUD_TEXT_COLOR``; a shorter list than ``lines`` is padded with
+        that colour.
     """
     if not lines:
         return
@@ -110,6 +122,7 @@ def draw_hud(frame: np.ndarray, lines: list[str]) -> None:
     origin_x, origin_y = HUD_ORIGIN
     last_baseline = origin_y + (len(lines) - 1) * HUD_LINE_GAP
     block_width = text_width + 2 * HUD_PADDING
+    per_line = colors if colors is not None else [HUD_TEXT_COLOR] * len(lines)
 
     cv2.rectangle(
         frame,
@@ -120,13 +133,14 @@ def draw_hud(frame: np.ndarray, lines: list[str]) -> None:
     )
 
     for index, line in enumerate(lines):
+        colour = per_line[index] if index < len(per_line) else HUD_TEXT_COLOR
         cv2.putText(
             frame,
             line,
             (origin_x + HUD_PADDING, origin_y + index * HUD_LINE_GAP),
             HUD_FONT,
             HUD_FONT_SCALE,
-            HUD_TEXT_COLOR,
+            colour,
             HUD_FONT_THICKNESS,
         )
 
@@ -149,6 +163,10 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
     logger = logging.getLogger("HoloForge")
     smoothed_fps = FPS_INIT
     last_frame = time.monotonic()
+
+    grab_detector = GrabDetector()
+    palm_x_smoother = Smoother()
+    palm_y_smoother = Smoother()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     logger.info("Hand-tracking loop running on camera; press '%s' to exit", chr(EXIT_KEY))
@@ -173,20 +191,34 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
 
         if landmarks is not None:
             pinch_ratio = tracker.get_pinch_ratio(landmarks)
+            grab_detector.update(pinch_ratio)
             palm_center = tracker.get_palm_center(landmarks)
+            smoothed_palm = (
+                palm_x_smoother.update(palm_center[0]),
+                palm_y_smoother.update(palm_center[1]),
+            )
+            state_text = "State: GRABBED" if grab_detector.is_grabbed else "State: IDLE"
+            state_colour = (
+                HUD_STATE_GRAB_COLOR if grab_detector.is_grabbed else HUD_STATE_IDLE_COLOR
+            )
             lines = [
                 f"FPS: {smoothed_fps:.1f}",
                 f"Pinch: {pinch_ratio:.3f}",
-                f"Palm: ({palm_center[0]:.3f}, {palm_center[1]:.3f})",
+                f"Palm: ({smoothed_palm[0]:.3f}, {smoothed_palm[1]:.3f})",
+                state_text,
             ]
+            colors = [HUD_TEXT_COLOR, HUD_TEXT_COLOR, HUD_TEXT_COLOR, state_colour]
         else:
+            # No hand: the gesture state holds its last value and the HUD
+            # stays identical to Day 2 so the exit path is unchanged.
             lines = [
                 f"FPS: {smoothed_fps:.1f}",
                 "Pinch: N/A",
                 "No hand detected",
             ]
+            colors = None
 
-        draw_hud(overlay, lines)
+        draw_hud(overlay, lines, colors)
         cv2.imshow(WINDOW_NAME, overlay)
 
         if cv2.waitKey(1) & 0xFF == EXIT_KEY:
