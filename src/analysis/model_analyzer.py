@@ -40,6 +40,63 @@ except ImportError:  # pragma: no cover - verified at runtime
     trimesh = None
 
 
+def _flatten_scene(
+    obj: "trimesh.Trimesh" | "trimesh.Scene" | None,
+) -> Optional["trimesh.Trimesh"]:
+    """Collapse a ``trimesh.Scene`` into a single ``Trimesh``.
+
+    Photogrammetry exports frequently arrive as a scene holding several
+    sub-meshes; the renderer needs one connected edge table, so the parts are
+    concatenated. Non-mesh geometry (point clouds, lines) is dropped rather
+    than breaking the concatenation.
+
+    Parameters
+    ----------
+    obj : trimesh.Trimesh | trimesh.Scene | None
+        Object returned by ``trimesh.load``.
+
+    Returns
+    -------
+    trimesh.Trimesh | None
+        A single mesh, or ``None`` when the scene contains no usable geometry.
+    """
+    if isinstance(obj, trimesh.Scene):
+        meshes = [
+            geometry
+            for geometry in obj.geometry
+            if isinstance(geometry, trimesh.Trimesh) and len(geometry.faces) > 0
+        ]
+        if not meshes:
+            return None
+        return trimesh.util.concatenate(meshes)
+    if isinstance(obj, trimesh.Trimesh):
+        return obj
+    return None
+
+
+def _prepare(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
+    """Merge coincident vertices and drop degenerate faces before decimation.
+
+    A scan whose vertices were duplicated at patch seams otherwise decimates
+    unevenly, and zero-area faces can make the quadratic error metric diverge.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh to clean.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        The cleaned mesh, mutated in place.
+    """
+    mesh.merge_vertices()
+    nondegenerate = mesh.nondegenerate_faces()
+    if not bool(np.all(nondegenerate)):
+        mesh.update_faces(nondegenerate)
+    return mesh
+
+
 def _decimate(mesh: "trimesh.Trimesh", target: int) -> Optional["trimesh.Trimesh"]:
     """Decimate ``mesh`` to ``target`` faces, tolerating trimesh versions.
 
@@ -122,7 +179,43 @@ def _normalise_to_box(vertices: np.ndarray, mesh: "trimesh.Trimesh") -> np.ndarr
     return centred
 
 
-def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
+def _fallback(
+    filepath: str, exc: Optional[Exception] = None, reason: Optional[str] = None
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Fall back to the default cube and record why the scan was rejected.
+
+    Parameters
+    ----------
+    filepath : str
+        Path of the scan that was rejected, used in the warning.
+    exc : Exception | None
+        The exception that triggered the fallback, if any.
+    reason : str | None
+        Short human-readable reason when no exception was raised.
+
+    Returns
+    -------
+    vertices : np.ndarray
+        ``(8, 3)`` cube vertices.
+    edges : np.ndarray
+        ``(12, 2)`` cube edges.
+    face_count : int
+        ``0``, because no mesh faces were available to report.
+    """
+    if exc is not None:
+        logger.warning(
+            "Rejected %r: %s: %s; falling back to the default cube",
+            filepath,
+            type(exc).__name__,
+            exc,
+        )
+    if reason is not None:
+        logger.warning("Rejected %r: %s; falling back to the default cube", filepath, reason)
+    vertices, edges = make_cube()
+    return vertices, edges, 0
+
+
+def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
     """Load a photogrammetry scan and prepare it for wireframe rendering.
 
     The mesh is decimated to ``DECIMATION_TARGET`` faces when the
@@ -142,6 +235,9 @@ def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
         ``(n, 3)`` float64 vertex positions, centred and normalised.
     edges : np.ndarray
         ``(m, 2)`` intp vertex-index pairs, ``m <= MAX_EDGES``.
+    face_count : int
+        Original face count of the loaded mesh, or ``0`` when the scan could
+        not be used and the default cube was substituted.
 
     Notes
     -----
@@ -149,18 +245,28 @@ def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
     than aborting the run, so the application keeps working without an asset.
     """
     if trimesh is None:
-        logger.warning("trimesh is not installed; falling back to the default cube")
-        return make_cube()
+        return _fallback(filepath, reason="trimesh is not installed")
 
     try:
-        mesh = trimesh.load(str(filepath), force="mesh")
-    except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        logger.warning("Could not load %r: %s; falling back to the default cube", filepath, exc)
-        return make_cube()
+        raw = trimesh.load(str(filepath), force="mesh")
+    except Exception as exc:  # noqa: BLE001 - every failure becomes a fallback
+        return _fallback(filepath, exc)
 
-    if not isinstance(mesh, trimesh.Trimesh) or mesh.vertices.size == 0:
-        logger.warning("Loaded object is not a usable mesh; falling back to the default cube")
-        return make_cube()
+    mesh = _flatten_scene(raw)
+    if mesh is None:
+        return _fallback(filepath, reason="loaded object contains no usable mesh")
+
+    # Reported before cleaning: it is the count the scan actually shipped, and
+    # it is what mesh_face_count sees for the same file.
+    original_face_count = len(mesh.faces)
+
+    try:
+        mesh = _prepare(mesh)
+    except Exception as exc:  # noqa: BLE001 - every failure becomes a fallback
+        return _fallback(filepath, exc)
+
+    if len(mesh.faces) == 0:
+        return _fallback(filepath, reason="mesh has no faces after cleaning")
 
     decimated = _decimate(mesh, DECIMATION_TARGET)
     if decimated is not None:
@@ -168,19 +274,23 @@ def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
         logger.info(
             "Decimated %s from %d faces to %d faces; retaining %d edges",
             filepath,
-            len(mesh.faces),
+            original_face_count,
             len(decimated.faces),
             edges.shape[0],
         )
-    else:
-        edges = _subsample_edges(mesh, MAX_EDGES)
-        logger.warning(
-            "Decimation unavailable for %s; subsampled %d edges at random",
-            filepath,
-            edges.shape[0],
-        )
+        # The edges index decimated.vertices, so the returned vertex array
+        # must be the decimated one as well -- otherwise the renderer would
+        # wire up the wrong vertices.
+        return _normalise_to_box(decimated.vertices, decimated), edges, original_face_count
 
-    return _normalise_to_box(mesh.vertices, mesh), edges
+    edges = _subsample_edges(mesh, MAX_EDGES)
+    logger.warning(
+        "Decimation unavailable for %s; subsampled %d edges at random",
+        filepath,
+        edges.shape[0],
+    )
+
+    return _normalise_to_box(mesh.vertices, mesh), edges, original_face_count
 
 
 def mesh_face_count(filepath: str) -> int:

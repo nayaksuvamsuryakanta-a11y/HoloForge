@@ -19,7 +19,7 @@ from typing import List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from src.analysis.model_analyzer import load_and_prepare_mesh, mesh_face_count
+from src.analysis.model_analyzer import load_and_prepare_mesh
 from src.interaction.gesture_controller import GestureController, Mode
 from src.rendering.projection_3d import MIN_Z, Z_OFFSET, make_cube, project_points, rotation_matrix
 from src.rendering.wireframe_renderer import WireframeRenderer
@@ -333,7 +333,7 @@ def _load_model(model_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, str,
     model_name : str
         Display name for the HUD.
     face_count : int
-        Original face count of the mesh, ``0`` when unknown.
+        Original face count of the mesh, ``0`` when the cube was rendered.
     edge_count : int
         Number of edges that will be drawn.
     """
@@ -341,11 +341,10 @@ def _load_model(model_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, str,
     if model_path is None:
         logger.info("No model supplied; rendering the default cube")
         vertices, edges = make_cube()
-        return vertices, edges, "cube", 6, edges.shape[0]
+        return vertices, edges, "cube", 0, edges.shape[0]
 
     display_name = os.path.basename(model_path)
-    vertices, edges = load_and_prepare_mesh(model_path)
-    face_count = mesh_face_count(model_path)
+    vertices, edges, face_count = load_and_prepare_mesh(model_path)
     logger.info(
         "Rendering %s: %d original faces -> %d edges (%d vertices)",
         display_name,
@@ -520,10 +519,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger = logging.getLogger("HoloForge")
 
     logger.info("HoloForge v0.1.0 - Initializing...")
-    logger.info("Loading hand-landmarker model bundle")
-    logger.info("Opening webcam stream at %sx%s", FRAME_WIDTH, FRAME_HEIGHT)
-    logger.info("3D projection and holographic renderer ready")
-    logger.info("Gesture controller online: grab-rotate, spin-and-catch, two-hand zoom/pan")
+    logger.info("Phase 1: Vision pipeline [COMPLETE]")
+    logger.info("Phase 2: 3D rendering engine [COMPLETE]")
+    logger.info("Phase 3: Model analysis [IN PROGRESS]")
 
     capture: Optional[cv2.VideoCapture] = None
     tracker: Optional[HandTracker] = None

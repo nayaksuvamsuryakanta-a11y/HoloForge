@@ -22,16 +22,22 @@ import trimesh
 from src.analysis.model_analyzer import load_and_prepare_mesh, mesh_face_count
 from src.rendering.projection_3d import make_cube
 
-SUBDIVISIONS = 5
+SUBDIVISIONS = 4  # icosphere: 20 * 4**4 == 5120 faces
 
 
-def make_high_poly_mesh(path: str) -> int:
-    """Write a subdivided icosahedron to ``path``; return its face count."""
+def _subdivided_icosahedron() -> trimesh.Trimesh:
     mesh = trimesh.creation.icosahedron()
     for _ in range(SUBDIVISIONS):
         mesh = mesh.subdivide()
+    return mesh
+
+
+def export(mesh: trimesh.Trimesh, name: str = "scan.obj") -> str:
+    """Write ``mesh`` to a fresh temp .obj and return its path."""
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, name)
     mesh.export(path, file_type="obj")
-    return int(len(mesh.faces))
+    return path
 
 
 def temp_path(name: str) -> str:
@@ -41,47 +47,54 @@ def temp_path(name: str) -> str:
 
 class TestLoadAndPrepareMesh:
     def test_returns_vertex_and_edge_arrays(self) -> None:
-        vertices, edges = load_and_prepare_mesh(temp_path("scan.obj"))
+        vertices, edges, face_count = load_and_prepare_mesh(export(_subdivided_icosahedron()))
         assert isinstance(vertices, np.ndarray)
         assert isinstance(edges, np.ndarray)
+        assert isinstance(face_count, int)
         assert vertices.ndim == 2 and vertices.shape[1] == 3
         assert edges.ndim == 2 and edges.shape[1] == 2
 
+    def test_reports_the_original_face_count(self) -> None:
+        _, _, face_count = load_and_prepare_mesh(export(_subdivided_icosahedron()))
+        assert face_count == 20 * 4 ** SUBDIVISIONS
+
     def test_centres_the_mesh_on_the_origin(self) -> None:
-        vertices, _ = load_and_prepare_mesh(temp_path("scan.obj"))
+        vertices, _, _ = load_and_prepare_mesh(export(_subdivided_icosahedron()))
         # Centering is done against the bounding-box centroid, so the box --
         # rather than the arithmetic mean -- must be balanced on the origin.
         assert np.allclose(vertices.max(axis=0) + vertices.min(axis=0), 0.0, atol=1e-9)
 
     def test_normalises_to_the_cube_box(self) -> None:
-        vertices, _ = load_and_prepare_mesh(temp_path("scan.obj"))
+        vertices, _, _ = load_and_prepare_mesh(export(_subdivided_icosahedron()))
         span = float(vertices.ptp(axis=0).max())
         assert np.isclose(span, 150.0, atol=1e-6)
 
     def test_caps_the_edge_count(self) -> None:
-        _, edges = load_and_prepare_mesh(temp_path("scan.obj"))
+        _, edges, _ = load_and_prepare_mesh(export(_subdivided_icosahedron()))
         assert edges.shape[0] <= 5000
 
     def test_edges_stay_within_vertex_range(self) -> None:
-        vertices, edges = load_and_prepare_mesh(temp_path("scan.obj"))
+        vertices, edges, _ = load_and_prepare_mesh(export(_subdivided_icosahedron()))
         assert edges.min() >= 0
         assert edges.max() < vertices.shape[0]
 
     def test_falls_back_to_the_cube_for_a_missing_file(self) -> None:
-        vertices, edges = load_and_prepare_mesh(temp_path("does-not-exist.obj"))
+        vertices, edges, face_count = load_and_prepare_mesh(temp_path("does-not-exist.obj"))
         cube_vertices, cube_edges = make_cube()
         assert vertices.shape == cube_vertices.shape
         assert edges.shape == cube_edges.shape
+        assert face_count == 0
 
     def test_falls_back_to_the_cube_for_an_unreadable_file(self) -> None:
         # A file that exists but is not a valid mesh.
         path = temp_path("not-a-mesh.txt")
         with open(path, "w") as handle:
             handle.write("definitely not an OBJ file\n")
-        vertices, edges = load_and_prepare_mesh(path)
+        vertices, edges, face_count = load_and_prepare_mesh(path)
         cube_vertices, cube_edges = make_cube()
         assert vertices.shape == cube_vertices.shape
         assert edges.shape == cube_edges.shape
+        assert face_count == 0
 
     def test_uses_the_decimated_mesh_when_simplification_succeeds(self) -> None:
         # ``fast-simplification`` is not installed in this environment, so the
@@ -89,35 +102,44 @@ class TestLoadAndPrepareMesh:
         # and confirm the prepared geometry comes from the simplified mesh.
         small = trimesh.creation.icosahedron()
         original_edges = small.edges_unique.shape[0]
-        path = temp_path("fake.obj")
-        small.export(path, file_type="obj")
+        # A box is smaller than the icosahedron it replaces, so a strict
+        # equality check proves the decimated mesh -- not the original --
+        # supplies the returned edges.
+        fake_decimation = trimesh.creation.box()
+        path = export(small, "fake.obj")
 
         with mock.patch(
-            "trimesh.Trimesh.simplify_quadric_decimation", return_value=small
+            "trimesh.Trimesh.simplify_quadric_decimation", return_value=fake_decimation
         ) as patched:
-            vertices, edges = load_and_prepare_mesh(path)
+            vertices, edges, face_count = load_and_prepare_mesh(path)
 
         patched.assert_called()
-        # The returned edges must belong to the decimated mesh, not the
-        # original, otherwise decimation would be silently a no-op.
-        assert edges.shape[0] <= original_edges
+        assert edges.shape[0] == fake_decimation.edges_unique.shape[0]
+        assert edges.shape[0] < original_edges
+        assert face_count == len(small.faces)
+        # The returned edges index the returned vertices, so the renderer
+        # never wires up the wrong geometry.
+        assert edges.max() < vertices.shape[0]
         # Scaling a centred icosahedron keeps it centred on the origin.
         assert np.allclose(vertices.max(axis=0) + vertices.min(axis=0), 0.0, atol=1e-9)
 
     def test_handles_a_mesh_with_no_faces(self) -> None:
         empty = trimesh.Trimesh(vertices=np.zeros((3, 3), dtype=np.float64))
-        path = temp_path("empty.obj")
-        empty.export(path, file_type="obj")
+        path = export(empty, "empty.obj")
         # An empty export may be unreadable; either outcome must be safe.
-        vertices, edges = load_and_prepare_mesh(path)
+        vertices, edges, face_count = load_and_prepare_mesh(path)
+        cube_vertices, cube_edges = make_cube()
         assert isinstance(vertices, np.ndarray)
         assert isinstance(edges, np.ndarray)
+        assert face_count == 0
+        assert vertices.shape == cube_vertices.shape
+        assert edges.shape == cube_edges.shape
 
 
 class TestMeshFaceCount:
     def test_reports_the_original_face_count(self) -> None:
-        path = temp_path("scan.obj")
-        expected = make_high_poly_mesh(path)
+        path = export(_subdivided_icosahedron())
+        expected = int(len(_subdivided_icosahedron().faces))
         assert mesh_face_count(path) == expected
 
     def test_returns_zero_for_a_missing_file(self) -> None:
