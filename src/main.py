@@ -65,6 +65,12 @@ HUD_MODEL_COUNT_COLOR = (180, 180, 180)  # BGR light gray
 FPS_SMOOTHING = 0.9
 FPS_INIT = 30.0
 
+# Stage timing --------------------------------------------------------------
+# Exponential smoothing applied to each stage's latency, in milliseconds.
+INFERENCE_SMOOTHING = 0.95
+RENDER_SMOOTHING = 0.95
+TIMING_LOG_INTERVAL = 5.0  # seconds between stage-latency log lines
+
 # Window --------------------------------------------------------------------
 WINDOW_NAME = "HoloForge - Hand Tracking"
 EXIT_KEY = ord("q")
@@ -187,6 +193,8 @@ def build_hud(
     model_name: str,
     face_count: int,
     edge_count: int,
+    lod_edges: int = 0,
+    lod_mean_len: float = 0.0,
 ) -> Tuple[List[str], List[tuple[int, int, int]]]:
     """Assemble the HUD status lines and their per-line colours.
 
@@ -218,9 +226,14 @@ def build_hud(
     model_name : str
         Display name of the loaded model, ``"cube"`` when none was supplied.
     face_count : int
-        Original face count of the loaded mesh, ``0`` when unknown.
+        Original face count of the loaded mesh, ``0`` when the cube was rendered.
     edge_count : int
         Number of edges actually drawn this frame.
+    lod_edges : int
+        Number of edges rendered after Level-of-Detail selection, ``0`` when
+        the mesh was too small to build a ladder.
+    lod_mean_len : float
+        Mean projected length of the prepared edges, in pixels.
 
     Returns
     -------
@@ -278,6 +291,8 @@ def build_hud(
     lines.append(f"Faces: {face_count:,}" if face_count > 0 else "Faces: N/A")
     colors.append(HUD_MODEL_COUNT_COLOR)
     lines.append(f"Rendered Edges: {edge_count:,}")
+    colors.append(HUD_MODEL_COUNT_COLOR)
+    lines.append(f"LOD: {lod_edges} @ {lod_mean_len:.1f}px")
     colors.append(HUD_MODEL_COUNT_COLOR)
 
     return lines, colors
@@ -359,6 +374,7 @@ def run_loop(
     capture: cv2.VideoCapture,
     tracker: HandTracker,
     model_path: Optional[str] = None,
+    frame_skip: int = 1,
 ) -> int:
     """Process frames until the user presses the exit key.
 
@@ -375,6 +391,9 @@ def run_loop(
         Initialized hand landmarker.
     model_path : str | None
         Path to an external mesh to render, or ``None`` for the default cube.
+    frame_skip : int, default 1
+        Run the landmarker every ``frame_skip`` frames and reuse the cached
+        landmarks on the frames in between; 2 halves the inference cost.
 
     Returns
     -------
@@ -388,6 +407,13 @@ def run_loop(
     grab_detector = GrabDetector()
     palm_x_smoother = Smoother()
     palm_y_smoother = Smoother()
+
+    # Stage latencies and frame-skip state, tracked across the loop.
+    inference_ema = 0.0
+    render_ema = 0.0
+    last_timing = time.perf_counter()
+    frame_index = 0
+    cached_hands = None
 
     # Model, renderer and controller are allocated once, outside the hot loop.
     model_vertices, model_edges, model_name, face_count, edge_count = _load_model(model_path)
@@ -412,10 +438,22 @@ def run_loop(
         smoothed_fps = FPS_SMOOTHING * smoothed_fps + (1 - FPS_SMOOTHING) * measured_fps
         last_frame = now
 
-        hands = tracker.detect(frame, timestamp_ms)
+        # Inference stage: the landmarker. On a skipped frame the previous detection
+        # is reused, so the EMA genuinely records the work saved by frame skip.
+        t0 = time.perf_counter()
+        if frame_index % frame_skip == 0:
+            hands = tracker.detect(frame, timestamp_ms)
+            cached_hands = hands
+        else:
+            hands = cached_hands
+        inference_ema = INFERENCE_SMOOTHING * inference_ema + (1 - INFERENCE_SMOOTHING) * (
+            time.perf_counter() - t0
+        ) * 1000.0
+
         overlay = tracker.draw_skeleton(frame, hands)
 
-        # 3D pose follows the gesture controller, projected fresh each frame.
+        # Render stage: projection plus the wireframe pass.
+        t0 = time.perf_counter()
         rot = rotation_matrix(controller.rot_x, controller.rot_y, 0.0)
         transformed = (model_vertices @ rot.T) * controller.scale
         depth = transformed[:, 2] + Z_OFFSET
@@ -429,12 +467,26 @@ def run_loop(
             transformed,
         )
         overlay = renderer.draw(overlay, points2d, model_edges, depth=depth)
+        render_ema = RENDER_SMOOTHING * render_ema + (1 - RENDER_SMOOTHING) * (
+            time.perf_counter() - t0
+        ) * 1000.0
 
         key = cv2.waitKey(1) & 0xFF
         if key == EXIT_KEY:
             logger.info("User requested exit")
             break
         apply_keyboard(key, controller)
+
+        # Stage latencies are logged on a separate cadence from the FPS so the
+        # console is not flooded by a per-frame number.
+        if time.perf_counter() - last_timing >= TIMING_LOG_INTERVAL:
+            logger.info(
+                "Stage latencies (%.0f s EMA): inference %.2f ms, render %.2f ms",
+                TIMING_LOG_INTERVAL,
+                inference_ema,
+                render_ema,
+            )
+            last_timing = time.perf_counter()
 
         if hands is not None:
             pinch_ratio = tracker.get_pinch_ratio(hands[0])
@@ -461,6 +513,8 @@ def run_loop(
                 model_name=model_name,
                 face_count=face_count,
                 edge_count=edge_count,
+                lod_edges=renderer.active_edge_count,
+                lod_mean_len=renderer.mean_edge_length,
             )
         else:
             # No hand: the detectors keep their last value so a hand that
@@ -480,6 +534,8 @@ def run_loop(
                 model_name=model_name,
                 face_count=face_count,
                 edge_count=edge_count,
+                lod_edges=renderer.active_edge_count,
+                lod_mean_len=renderer.mean_edge_length,
             )
 
         draw_hud(overlay, lines, colors)
