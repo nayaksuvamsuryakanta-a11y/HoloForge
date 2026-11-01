@@ -121,7 +121,8 @@ and 4 are not yet started.
 | Keyboard fallback | Arrow keys | Rotate `5` degrees per press |
 | Keyboard fallback | `+` / `-` | Scale up / down by `0.1`, clamped to `0.5x`-`3.0x` |
 | Reset | `r` | Return rotation, scale and offset to their defaults |
-| Exit | `ESC` | Close the window |
+| Import scan | `--model <path>` | Render an external photogrammetry scan instead of the cube |
+| Exit | `q` | Close the window |
 
 ---
 

@@ -9,16 +9,19 @@ inertia, and Day 8 adds two-hand zoom/pan. Press ``q`` to shut down.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import math
+import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
+from src.analysis.model_analyzer import load_and_prepare_mesh, mesh_face_count
 from src.interaction.gesture_controller import GestureController, Mode
-from src.rendering.projection_3d import make_cube, project_points, rotation_matrix
+from src.rendering.projection_3d import MIN_Z, Z_OFFSET, make_cube, project_points, rotation_matrix
 from src.rendering.wireframe_renderer import WireframeRenderer
 from src.utils.helpers import setup_logging
 from src.vision.hand_tracker import GrabDetector, HandTracker, Smoother
@@ -51,6 +54,10 @@ HUD_MODE_IDLE_COLOR = (0, 255, 0)      # BGR green
 HUD_MODE_ROTATE_COLOR = (0, 255, 255)  # BGR yellow
 HUD_MODE_TRANSFORM_COLOR = (255, 165, 0)  # BGR orange
 HUD_SCALE_COLOR = (200, 200, 255)  # BGR pale blue
+
+# Colours for the imported-model lines of the HUD.
+HUD_MODEL_NAME_COLOR = (200, 255, 255)  # BGR pale cyan
+HUD_MODEL_COUNT_COLOR = (180, 180, 180)  # BGR light gray
 
 # FPS estimation ------------------------------------------------------------
 # Weight given to the previous smoothed value; a high smoothing factor keeps
@@ -177,13 +184,18 @@ def build_hud(
     mode: Mode,
     scale: float,
     hand_present: bool,
+    model_name: str,
+    face_count: int,
+    edge_count: int,
 ) -> Tuple[List[str], List[tuple[int, int, int]]]:
     """Assemble the HUD status lines and their per-line colours.
 
     The first three lines are the Day 2 telemetry block (FPS, pinch, palm).
     A hand-independent ``State`` line follows, coloured to show whether the
-    reading is live, grabbed or stale. The last two lines report the
-    interaction mode and the current model scale.
+    reading is live, grabbed or stale. The next two lines report the
+    interaction mode and the current model scale. When an external mesh is
+    loaded, the final block names the file and reports how much of its
+    geometry survived decimation.
 
     Parameters
     ----------
@@ -203,6 +215,12 @@ def build_hud(
         Current model scale.
     hand_present : bool
         Whether the landmarker reported a hand this frame.
+    model_name : str
+        Display name of the loaded model, ``"cube"`` when none was supplied.
+    face_count : int
+        Original face count of the loaded mesh, ``0`` when unknown.
+    edge_count : int
+        Number of edges actually drawn this frame.
 
     Returns
     -------
@@ -255,6 +273,13 @@ def build_hud(
     lines.append(f"Scale: {scale:.2f}x")
     colors.append(HUD_SCALE_COLOR)
 
+    lines.append(f"Model: {model_name}")
+    colors.append(HUD_MODEL_NAME_COLOR)
+    lines.append(f"Faces: {face_count:,}" if face_count > 0 else "Faces: N/A")
+    colors.append(HUD_MODEL_COUNT_COLOR)
+    lines.append(f"Rendered Edges: {edge_count:,}")
+    colors.append(HUD_MODEL_COUNT_COLOR)
+
     return lines, colors
 
 
@@ -291,11 +316,55 @@ def apply_keyboard(key: int, controller: GestureController) -> None:
         controller.scale = max(controller.SCALE_MIN, controller.scale - SCALE_STEP)
 
 
-def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
+def _load_model(model_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, str, int, int]:
+    """Load an external mesh, falling back to the default cube.
+
+    Parameters
+    ----------
+    model_path : str | None
+        Path to a mesh file, or ``None`` to render the cube.
+
+    Returns
+    -------
+    vertices : np.ndarray
+        ``(n, 3)`` model-space vertex positions.
+    edges : np.ndarray
+        ``(m, 2)`` vertex-index pairs, capped to a few thousand edges.
+    model_name : str
+        Display name for the HUD.
+    face_count : int
+        Original face count of the mesh, ``0`` when unknown.
+    edge_count : int
+        Number of edges that will be drawn.
+    """
+    logger = logging.getLogger("HoloForge")
+    if model_path is None:
+        logger.info("No model supplied; rendering the default cube")
+        vertices, edges = make_cube()
+        return vertices, edges, "cube", 6, edges.shape[0]
+
+    display_name = os.path.basename(model_path)
+    vertices, edges = load_and_prepare_mesh(model_path)
+    face_count = mesh_face_count(model_path)
+    logger.info(
+        "Rendering %s: %d original faces -> %d edges (%d vertices)",
+        display_name,
+        face_count,
+        edges.shape[0],
+        vertices.shape[0],
+    )
+    return vertices, edges, display_name, face_count, edges.shape[0]
+
+
+def run_loop(
+    capture: cv2.VideoCapture,
+    tracker: HandTracker,
+    model_path: Optional[str] = None,
+) -> int:
     """Process frames until the user presses the exit key.
 
     Each frame mirrors the webcam image, detects hands, draws the skeleton
-    overlay, projects and draws the 3D cube, and paints a telemetry HUD.
+    overlay, projects and draws the 3D model, and paints a telemetry HUD.
     Gesture input feeds the ``GestureController``; arrow keys, ``+/-`` and
     ``r`` offer the same transforms without a hand.
 
@@ -305,6 +374,8 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
         Open webcam stream.
     tracker : HandTracker
         Initialized hand landmarker.
+    model_path : str | None
+        Path to an external mesh to render, or ``None`` for the default cube.
 
     Returns
     -------
@@ -319,9 +390,9 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
     palm_x_smoother = Smoother()
     palm_y_smoother = Smoother()
 
-    # 3D model and renderer are allocated once, outside the hot loop.
-    cube_vertices, cube_edges = make_cube()
-    renderer = WireframeRenderer()
+    # Model, renderer and controller are allocated once, outside the hot loop.
+    model_vertices, model_edges, model_name, face_count, edge_count = _load_model(model_path)
+    renderer = WireframeRenderer(holographic=model_path is not None)
     controller = GestureController()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
@@ -347,14 +418,18 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
 
         # 3D pose follows the gesture controller, projected fresh each frame.
         rot = rotation_matrix(controller.rot_x, controller.rot_y, 0.0)
+        transformed = (model_vertices @ rot.T) * controller.scale
+        depth = transformed[:, 2] + Z_OFFSET
+        depth = np.where(depth < MIN_Z, MIN_Z, depth)
         points2d = project_points(
-            cube_vertices,
+            model_vertices,
             rot,
             controller.scale,
             tuple(controller.offset),
             frame.shape,
+            transformed,
         )
-        overlay = renderer.draw(overlay, points2d, cube_edges)
+        overlay = renderer.draw(overlay, points2d, model_edges, depth=depth)
 
         key = cv2.waitKey(1) & 0xFF
         if key == EXIT_KEY:
@@ -384,6 +459,9 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
                 mode=controller.mode,
                 scale=controller.scale,
                 hand_present=True,
+                model_name=model_name,
+                face_count=face_count,
+                edge_count=edge_count,
             )
         else:
             # No hand: the detectors keep their last value so a hand that
@@ -400,6 +478,9 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
                 mode=controller.mode,
                 scale=controller.scale,
                 hand_present=False,
+                model_name=model_name,
+                face_count=face_count,
+                edge_count=edge_count,
             )
 
         draw_hud(overlay, lines, colors)
@@ -408,8 +489,13 @@ def run_loop(capture: cv2.VideoCapture, tracker: HandTracker) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run the real-time hand-tracking pipeline until the user quits.
+
+    Parameters
+    ----------
+    argv : sequence[str] | None
+        Command-line arguments; ``None`` reads ``sys.argv``.
 
     Returns
     -------
@@ -417,13 +503,27 @@ def main() -> int:
         Zero on clean shutdown, non-zero if the camera or model could not be
         brought online.
     """
+    parser = argparse.ArgumentParser(
+        description="HoloForge: hand-tracked 3D wireframe overlay."
+    )
+    parser.add_argument(
+        "--model",
+        metavar="PATH",
+        default=None,
+        help="Photogrammetry scan (.obj, .ply, .stl ...) to render instead of "
+             "the default cube. Large scans are decimated to a few thousand "
+             "edges automatically.",
+    )
+    args = parser.parse_args(argv)
+
     setup_logging()
     logger = logging.getLogger("HoloForge")
 
     logger.info("HoloForge v0.1.0 - Initializing...")
-    logger.info("[PENDING] Load hand-landmarker model and camera stream")
-    logger.info("[PENDING] Initialize 3D projection and rendering surface")
-    logger.info("[PENDING] Start gesture command analysis pipeline")
+    logger.info("Loading hand-landmarker model bundle")
+    logger.info("Opening webcam stream at %sx%s", FRAME_WIDTH, FRAME_HEIGHT)
+    logger.info("3D projection and holographic renderer ready")
+    logger.info("Gesture controller online: grab-rotate, spin-and-catch, two-hand zoom/pan")
 
     capture: Optional[cv2.VideoCapture] = None
     tracker: Optional[HandTracker] = None
@@ -431,7 +531,7 @@ def main() -> int:
         capture = open_webcam()
         tracker = HandTracker()
         logger.info("Hand landmarker and camera stream online")
-        return run_loop(capture, tracker)
+        return run_loop(capture, tracker, model_path=args.model)
     except (FileNotFoundError, RuntimeError) as exc:
         logger.error("%s", exc)
         return 1

@@ -13,7 +13,7 @@ frame: pitch (x), then yaw (y), then roll (z).
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -70,6 +70,7 @@ def project_points(
     scale: float,
     offset: Tuple[float, float],
     frame_shape: Tuple[int, ...],
+    transformed: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Project 3D vertices into 2D screen coordinates.
 
@@ -91,6 +92,10 @@ def project_points(
     frame_shape : tuple[int, ...]
         Frame dimensions ``(height, width, ...)``; only the first two axes
         are read.
+    transformed : np.ndarray | None
+        Pre-rotated and scaled vertices ``(n, 3)``. When supplied the rotation
+        and scaling step is skipped so the caller can reuse the same array,
+        for example to derive a depth buffer for the renderer.
 
     Returns
     -------
@@ -99,7 +104,8 @@ def project_points(
     """
     height, width = frame_shape[:2]
 
-    transformed = (vertices @ rot.T) * scale
+    if transformed is None:
+        transformed = (vertices @ rot.T) * scale
     depth = transformed[:, 2] + Z_OFFSET
     depth = np.where(depth < MIN_Z, MIN_Z, depth)
 
