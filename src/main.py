@@ -28,10 +28,13 @@ from src.analysis.model_analyzer import (
 )
 from src.interaction.gesture_controller import GestureController, Mode
 from src.interaction.voice_commands import VoiceLayer
+from src.interaction.vertex_measure import VertexMeasure
 from src.rendering.projection_3d import MIN_Z, Z_OFFSET, make_cube, project_points, rotation_matrix
 from src.rendering.wireframe_renderer import WireframeRenderer
 from src.utils.helpers import setup_logging
 from src.utils.audio_feedback import SoundBoard
+from src.utils.config import load_config, write_config
+from src.utils.telemetry import SessionTelemetry
 from src.vision.hand_tracker import GrabDetector, HandTracker, Smoother
 
 __all__ = ["main"]
@@ -92,6 +95,8 @@ KEY_DOWN = 2490368
 
 ROTATE_STEP = 5.0  # degrees per arrow press
 SCALE_STEP = 0.1  # scale delta per +/- press
+MEASURE_COLOR = (255, 0, 255)
+HIGHLIGHT_COLOR = (255, 255, 255)
 
 
 def open_webcam() -> cv2.VideoCapture:
@@ -207,6 +212,7 @@ def build_hud(
     analysis_visible: bool = False,
     explode_f: float = 0.0,
     voice_status: str = "off",
+    measurement_count: int = 0,
 ) -> Tuple[List[str], List[tuple[int, int, int]]]:
     """Assemble the HUD status lines and their per-line colours.
 
@@ -292,6 +298,7 @@ def build_hud(
         Mode.IDLE: HUD_MODE_IDLE_COLOR,
         Mode.ROTATE: HUD_MODE_ROTATE_COLOR,
         Mode.TRANSFORM: HUD_MODE_TRANSFORM_COLOR,
+        Mode.MEASURE: (255, 0, 255),
     }[mode]
     lines.append(f"Mode: {mode.name}")
     colors.append(mode_colour)
@@ -309,6 +316,9 @@ def build_hud(
     lines.extend((f"Explode: {explode_f:.2f}", f"Voice: {voice_status}"))
     colors.extend((HUD_MODEL_COUNT_COLOR, HUD_MODEL_COUNT_COLOR))
 
+    if analysis_visible:
+        lines.append(f"Measurements: {measurement_count}")
+        colors.append(HUD_MODEL_COUNT_COLOR)
     if analysis_visible and analysis_metrics is not None:
         volume = analysis_metrics["volume"]
         lines.append(
@@ -450,6 +460,24 @@ def _render_stage(
     return renderer.draw(frame, points2d, model_edges, depth=depth)
 
 
+def _draw_measurement(frame: np.ndarray, points: np.ndarray, measure: VertexMeasure,
+                      base_vertices: np.ndarray) -> None:
+    if measure.highlight is not None:
+        x, y = np.rint(points[measure.highlight]).astype(int)
+        cv2.circle(frame, (x, y), 5, HIGHLIGHT_COLOR, -1, cv2.LINE_AA)
+    pairs = list(measure.measurements)
+    if measure.active and measure.anchor is not None and measure.target is not None:
+        pairs.append((measure.anchor, measure.target))
+    for anchor, target in pairs:
+        a = tuple(np.rint(points[anchor]).astype(int))
+        b = tuple(np.rint(points[target]).astype(int))
+        cv2.line(frame, a, b, MEASURE_COLOR, 2, cv2.LINE_AA)
+        distance = float(np.linalg.norm(base_vertices[target] - base_vertices[anchor]))
+        midpoint = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+        cv2.putText(frame, f"{distance:.1f} mm", midpoint,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, MEASURE_COLOR, 1, cv2.LINE_AA)
+
+
 def _run_loop(
     capture: cv2.VideoCapture,
     tracker: HandTracker,
@@ -457,6 +485,8 @@ def _run_loop(
     frame_skip: int = 1,
     soundboard: Optional[SoundBoard] = None,
     voice: Optional[VoiceLayer] = None,
+    tunables: Optional[dict] = None,
+    telemetry: Optional[SessionTelemetry] = None,
 ) -> int:
     """Process frames until the user presses the exit key.
 
@@ -486,9 +516,10 @@ def _run_loop(
     smoothed_fps = FPS_INIT
     last_frame = time.monotonic()
 
-    grab_detector = GrabDetector()
-    palm_x_smoother = Smoother()
-    palm_y_smoother = Smoother()
+    tuning = tunables or load_config()
+    grab_detector = GrabDetector(tuning["grab_threshold"], tuning["release_threshold"])
+    palm_x_smoother = Smoother(alpha=tuning["smoothing_alpha"])
+    palm_y_smoother = Smoother(alpha=tuning["smoothing_alpha"])
 
     # Stage latencies and frame-skip state, tracked across the loop.
     inference_ema = 0.0
@@ -517,7 +548,7 @@ def _run_loop(
         soundboard.play("error")
     renderer = WireframeRenderer(holographic=model_path is not None)
     renderer.prepare_lod(model_edges)
-    controller = GestureController()
+    controller = GestureController(tuning["rotation_sensitivity"], tuning["pan_sensitivity"])
     # Exploded geometry is a render-only displacement; exports use the source mesh.
     if prepared_mesh is not None:
         normals = np.asarray(prepared_mesh.vertex_normals, dtype=np.float64)
@@ -530,6 +561,8 @@ def _run_loop(
     displaced_vertices = np.empty_like(model_vertices)
     explode_target = 0.0
     explode_f = 0.0
+    measure = VertexMeasure()
+    session_start = time.monotonic()
     analysis_visible = False
     exported_message: Optional[str] = None
     exported_message_until = 0.0
@@ -596,6 +629,15 @@ def _run_loop(
             explode_target = 0.0 if explode_target else 1.0
         elif key == ord("v") and soundboard is not None:
             soundboard.toggle_mute()
+        elif key == ord("m"):
+            measure.clear()
+            if controller.mode == Mode.MEASURE:
+                controller.mode = Mode.IDLE
+        elif key == ord("l") and telemetry is not None:
+            telemetry.toggle()
+        elif key == ord("c"):
+            write_config(tuning)
+            logger.info("Wrote current tunables to config.json")
         elif key == ord("a"):
             analysis_visible = not analysis_visible
         elif key == ord("e"):
@@ -634,14 +676,36 @@ def _run_loop(
             if soundboard is not None and grab_detector.is_grabbed != was_grabbed:
                 soundboard.play("grab" if grab_detector.is_grabbed else "release")
             palm_center = tracker.get_palm_center(hands[0])
+            cursor = (float(hands[0][8].x) * overlay.shape[1],
+                      float(hands[0][8].y) * overlay.shape[0])
+            pick_points = project_points(
+                displaced_vertices,
+                rotation_matrix(controller.rot_x, controller.rot_y, 0.0),
+                controller.scale,
+                tuple(controller.offset),
+                overlay.shape,
+            )
+            nearest = measure.nearest(pick_points, cursor)
+            if not grab_detector.is_grabbed:
+                measure.highlight = nearest
+            pinch_started = grab_detector.is_grabbed and not was_grabbed
+            if pinch_started and measure.highlight is not None:
+                measure.begin(measure.highlight)
+            if measure.active:
+                if grab_detector.is_grabbed:
+                    measure.update(nearest)
+                else:
+                    measure.release()
             smoothed_palm = (
                 palm_x_smoother.update(palm_center[0]),
                 palm_y_smoother.update(palm_center[1]),
             )
-            controller.update_one_hand(smoothed_palm, grab_detector.is_grabbed, delta)
-
-            stats = tracker.get_two_hand_stats(hands)
-            controller.update_two_hands(stats, delta)
+            if measure.active or (pinch_started and measure.anchor is not None):
+                controller.mode = Mode.MEASURE
+            else:
+                controller.update_one_hand(smoothed_palm, grab_detector.is_grabbed, delta)
+                stats = tracker.get_two_hand_stats(hands)
+                controller.update_two_hands(stats, delta)
 
             lines, colors = build_hud(
                 smoothed_fps=smoothed_fps,
@@ -661,13 +725,17 @@ def _run_loop(
                 analysis_visible=analysis_visible,
                 explode_f=explode_f,
                 voice_status=voice.status if voice is not None else "off",
+                measurement_count=measure.count,
             )
         else:
             # No hand: the detectors keep their last value so a hand that
             # leaves and returns resumes from the previous state instead of
             # resetting. The State line stays visible, coloured amber to
             # signal that the reading is stale.
-            controller.update_two_hands(None, delta)
+            if measure.active:
+                controller.mode = Mode.MEASURE
+            else:
+                controller.update_two_hands(None, delta)
             lines, colors = build_hud(
                 smoothed_fps=smoothed_fps,
                 pinch_ratio=None,
@@ -686,6 +754,7 @@ def _run_loop(
                 analysis_visible=analysis_visible,
                 explode_f=explode_f,
                 voice_status=voice.status if voice is not None else "off",
+                measurement_count=measure.count,
             )
 
         if exported_message and time.monotonic() < exported_message_until:
@@ -693,6 +762,27 @@ def _run_loop(
             colors.append(HUD_MODEL_NAME_COLOR)
         elif time.monotonic() >= exported_message_until:
             exported_message = None
+
+        display_points = project_points(
+            displaced_vertices,
+            rotation_matrix(controller.rot_x, controller.rot_y, 0.0),
+            controller.scale,
+            tuple(controller.offset),
+            overlay.shape,
+        )
+        _draw_measurement(overlay, display_points, measure, model_vertices)
+
+        if telemetry is not None:
+            telemetry.record({
+                "t": time.monotonic() - session_start,
+                "fps": smoothed_fps,
+                "mode": controller.mode.name,
+                "grabbed": grab_detector.is_grabbed,
+                "pinch": pinch_ratio if hands is not None else None,
+                "lod_level": renderer._lod_index,
+                "edge_count": renderer.active_edge_count,
+                "explode_f": explode_f,
+            })
 
         draw_hud(overlay, lines, colors)
         cv2.imshow(WINDOW_NAME, overlay)
@@ -707,13 +797,17 @@ def run_loop(
     model_path: Optional[str] = None,
     frame_skip: int = 1,
     voice_enabled: bool = False,
+    tunables: Optional[dict] = None,
 ) -> int:
     """Run interaction and close optional audio and voice resources."""
     soundboard = SoundBoard()
     voice = VoiceLayer(enabled=voice_enabled)
+    telemetry = SessionTelemetry(os.path.basename(model_path) if model_path else "cube")
     try:
-        return _run_loop(capture, tracker, model_path, frame_skip, soundboard, voice)
+        return _run_loop(capture, tracker, model_path, frame_skip, soundboard, voice,
+                         tunables, telemetry)
     finally:
+        telemetry.stop()
         voice.stop()
         soundboard.close()
 
@@ -751,9 +845,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Run hand inference every N frames (default: 1).",
     )
     parser.add_argument("--voice", action="store_true", help="Enable optional voice commands.")
+    parser.add_argument("--grab-threshold", type=float)
+    parser.add_argument("--release-threshold", type=float)
+    parser.add_argument("--smoothing-alpha", type=float)
+    parser.add_argument("--rotation-sensitivity", type=float)
+    parser.add_argument("--pan-sensitivity", type=float)
     args = parser.parse_args(argv)
     if args.frame_skip < 1:
         parser.error("--frame-skip must be at least 1")
+    try:
+        tunables = load_config(cli_overrides={
+            "grab_threshold": args.grab_threshold,
+            "release_threshold": args.release_threshold,
+            "smoothing_alpha": args.smoothing_alpha,
+            "rotation_sensitivity": args.rotation_sensitivity,
+            "pan_sensitivity": args.pan_sensitivity,
+        })
+    except ValueError as exc:
+        parser.error(str(exc))
 
     setup_logging()
     logger = logging.getLogger("HoloForge")
@@ -772,6 +881,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_loop(
             capture, tracker, model_path=args.model, frame_skip=args.frame_skip,
             voice_enabled=args.voice,
+            tunables=tunables,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         logger.error("%s", exc)

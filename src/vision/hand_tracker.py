@@ -106,7 +106,7 @@ class Smoother:
     which is what keeps a tracked palm position from jittering frame to frame.
     """
 
-    def __init__(self, initial: float = 0.0) -> None:
+    def __init__(self, initial: float = 0.0, alpha: float = SMOOTHING_ALPHA) -> None:
         """Seed the filter with an initial value.
 
         Parameters
@@ -115,10 +115,11 @@ class Smoother:
             Starting value of the running average.
         """
         self._value = initial
+        self.alpha = float(alpha)
 
     def update(self, value: float) -> float:
         """Blend ``value`` into the running average and return the result."""
-        self._value += SMOOTHING_ALPHA * (value - self._value)
+        self._value += self.alpha * (value - self._value)
         return self._value
 
 
@@ -130,9 +131,12 @@ class GrabDetector:
     so that noise around the boundary cannot toggle it repeatedly.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, grab_threshold: float = GRAB_THRESHOLD,
+                 release_threshold: float = RELEASE_THRESHOLD) -> None:
         """Start in the released state."""
         self._grabbed = False
+        self.grab_threshold = float(grab_threshold)
+        self.release_threshold = float(release_threshold)
 
     def update(self, pinch_ratio: float) -> bool:
         """Advance the state machine and return the new grabbed state.
@@ -147,9 +151,9 @@ class GrabDetector:
         bool
             True if the hand is now grabbed, False otherwise.
         """
-        if not self._grabbed and pinch_ratio < GRAB_THRESHOLD:
+        if not self._grabbed and pinch_ratio < self.grab_threshold:
             self._grabbed = True
-        elif self._grabbed and pinch_ratio > RELEASE_THRESHOLD:
+        elif self._grabbed and pinch_ratio > self.release_threshold:
             self._grabbed = False
         return self._grabbed
 

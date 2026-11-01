@@ -18,6 +18,7 @@ class Mode(Enum):
     IDLE = auto()  # no hand, no gesture
     ROTATE = auto()  # one hand is grabbed, driving rotation
     TRANSFORM = auto()  # two hands are driving scale and pan
+    MEASURE = auto()  # a pinch episode is selecting measurement vertices
 
 
 class GestureController:
@@ -76,7 +77,8 @@ class GestureController:
     SCALE_MIN = 0.5
     SCALE_MAX = 3.0
 
-    def __init__(self) -> None:
+    def __init__(self, rotation_sensitivity: float = ROTATION_SENSITIVITY,
+                 pan_sensitivity: float = PAN_SENSITIVITY) -> None:
         """Start the model unrotated, unscaled and centred."""
         self.rot_x = 0.0
         self.rot_y = 0.0
@@ -84,6 +86,8 @@ class GestureController:
         self.offset: np.ndarray = np.zeros(2, dtype=np.float64)
         self.angular_velocity: np.ndarray = np.zeros(2, dtype=np.float64)
         self.mode = Mode.IDLE
+        self.rotation_sensitivity = float(rotation_sensitivity)
+        self.pan_sensitivity = float(pan_sensitivity)
 
         self._last_palm: Optional[np.ndarray] = None
         self._two_hand_frames = 0
@@ -115,7 +119,7 @@ class GestureController:
             delta = palm - self._last_palm
             if is_grabbed:
                 # Catch: velocity is sourced from the current hand motion.
-                self.angular_velocity = delta * self.ROTATION_SENSITIVITY
+                self.angular_velocity = delta * self.rotation_sensitivity
             else:
                 self.angular_velocity *= math.exp(-dt / self.TAU)
 
@@ -158,7 +162,7 @@ class GestureController:
                             self.SCALE_MIN,
                             self.SCALE_MAX,
                         )
-                    self.offset += (midpoint - prev_midpoint) * self.PAN_SENSITIVITY
+                    self.offset += (midpoint - prev_midpoint) * self.pan_sensitivity
 
                 self._prev_stats = {"midpoint": midpoint.copy(), "span": span}
             return

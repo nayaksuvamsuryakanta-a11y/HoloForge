@@ -1,0 +1,7 @@
+{
+  "grab_threshold": 0.35,
+  "release_threshold": 0.5,
+  "smoothing_alpha": 0.2,
+  "rotation_sensitivity": 3.0,
+  "pan_sensitivity": 1.0
+}
