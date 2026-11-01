@@ -270,7 +270,10 @@ def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
 
     decimated = _decimate(mesh, DECIMATION_TARGET)
     if decimated is not None:
-        edges = np.asarray(decimated.edges_unique, dtype=np.intp)
+        # The decimation path must honour the same budget as the fallback,
+        # otherwise a simplified scan could exceed MAX_EDGES and stall the
+        # frame with more draw calls than the renderer expects.
+        edges = _subsample_edges(decimated, MAX_EDGES)
         logger.info(
             "Decimated %s from %d faces to %d faces; retaining %d edges",
             filepath,
