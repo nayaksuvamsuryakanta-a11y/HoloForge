@@ -18,6 +18,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+import trimesh
 
 from src.analysis.model_analyzer import (
     compute_metrics,
@@ -530,9 +531,18 @@ def _run_loop(
 
     # Model, renderer and controller are allocated once, outside the hot loop.
     prepared_mesh = None
+    active_model_path = model_path
     try:
         if model_path is None:
             model_vertices, model_edges = make_cube()
+            cube_faces = np.array([
+                [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                [0, 7, 3], [0, 4, 7], [1, 2, 6], [1, 6, 5],
+                [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2],
+            ], dtype=np.int64)
+            prepared_mesh = trimesh.Trimesh(
+                vertices=model_vertices, faces=cube_faces, process=False
+            )
             model_name, face_count = "cube", 0
         else:
             prepared_mesh, model_edges, face_count = load_prepared_mesh(model_path)
@@ -542,21 +552,23 @@ def _run_loop(
     except Exception as exc:
         logger.warning("Could not prepare model: %s; using default cube", exc)
         model_vertices, model_edges, model_name, face_count, edge_count = _load_model(None)
-    model_mesh = load_source_mesh(model_path) if model_path is not None else None
+        active_model_path = None
+        prepared_mesh = trimesh.Trimesh(
+            vertices=model_vertices,
+            faces=np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                            [0, 7, 3], [0, 4, 7], [1, 2, 6], [1, 6, 5],
+                            [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2]]),
+            process=False,
+        )
+        if soundboard is not None:
+            soundboard.play("error")
+    model_mesh = load_source_mesh(active_model_path) if active_model_path is not None else None
     analysis_metrics = compute_metrics(model_mesh) if model_mesh is not None else None
-    if model_path is not None and face_count == 0 and soundboard is not None:
-        soundboard.play("error")
-    renderer = WireframeRenderer(holographic=model_path is not None)
+    renderer = WireframeRenderer(holographic=active_model_path is not None)
     renderer.prepare_lod(model_edges)
     controller = GestureController(tuning["rotation_sensitivity"], tuning["pan_sensitivity"])
     # Exploded geometry is a render-only displacement; exports use the source mesh.
-    if prepared_mesh is not None:
-        normals = np.asarray(prepared_mesh.vertex_normals, dtype=np.float64)
-    else:
-        radial = model_vertices - model_vertices.mean(axis=0)
-        lengths = np.linalg.norm(radial, axis=1)
-        normals = np.divide(radial, lengths[:, None], out=np.zeros_like(radial),
-                             where=lengths[:, None] > 0)
+    normals = np.asarray(prepared_mesh.vertex_normals, dtype=np.float64)
     explode_offset = normals * 40.0
     displaced_vertices = np.empty_like(model_vertices)
     explode_target = 0.0
@@ -612,13 +624,13 @@ def _run_loop(
         voice_commands = voice.drain() if voice is not None else []
         for command in voice_commands:
             if command == "analyze":
-                analysis_visible = not analysis_visible
+                key = ord("a")
             elif command == "export":
                 key = ord("e")
             elif command == "reset":
-                controller.reset()
+                key = ord("r")
             elif command == "explode":
-                explode_target = 0.0 if explode_target else 1.0
+                key = ord("x")
             elif command == "quit":
                 key = EXIT_KEY
         was_grabbed = grab_detector.is_grabbed
@@ -689,7 +701,8 @@ def _run_loop(
             if not grab_detector.is_grabbed:
                 measure.highlight = nearest
             pinch_started = grab_detector.is_grabbed and not was_grabbed
-            if pinch_started and measure.highlight is not None:
+            measurement_started = pinch_started and measure.highlight is not None
+            if measurement_started:
                 measure.begin(measure.highlight)
             if measure.active:
                 if grab_detector.is_grabbed:
@@ -700,7 +713,7 @@ def _run_loop(
                 palm_x_smoother.update(palm_center[0]),
                 palm_y_smoother.update(palm_center[1]),
             )
-            if measure.active or (pinch_started and measure.anchor is not None):
+            if measure.active or measurement_started:
                 controller.mode = Mode.MEASURE
             else:
                 controller.update_one_hand(smoothed_palm, grab_detector.is_grabbed, delta)
@@ -736,6 +749,7 @@ def _run_loop(
                 controller.mode = Mode.MEASURE
             else:
                 controller.update_two_hands(None, delta)
+            measure.highlight = None
             lines, colors = build_hud(
                 smoothed_fps=smoothed_fps,
                 pinch_ratio=None,

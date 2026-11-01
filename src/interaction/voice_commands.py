@@ -82,4 +82,4 @@ class VoiceLayer:
 
     @property
     def status(self) -> str:
-        return "on" if self.enabled else "off"
+        return self._last_command if self.enabled and self._last_command else "off"

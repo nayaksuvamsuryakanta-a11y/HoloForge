@@ -19,6 +19,9 @@ assets/models/*.obj
 # Generated runtime output
 output/*
 !output/.gitkeep
+!output/stills/
+output/stills/*
+!output/stills/*.png
 
 # Editor / OS metadata
 .idea/

@@ -5,8 +5,8 @@
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/)
 [![OpenCV](https://img.shields.io/badge/OpenCV-4.x-green)](https://opencv.org/)
 [![MediaPipe](https://img.shields.io/badge/MediaPipe-Tasks-orange)](https://mediapipe.dev/)
-[![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)](tests/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+[![Tests](https://img.shields.io/badge/tests-87%20passing-brightgreen)](tests/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 HoloForge tracks hand gestures through a webcam to manipulate, inspect, and export
 3D meshes as a real-time holographic-style wireframe.
@@ -18,6 +18,8 @@ HoloForge tracks hand gestures through a webcam to manipulate, inspect, and expo
 | Palm: (0.512, 0.478)                           |
 | State: GRABBED                                 |
 | Mode: ROTATE                                   |
+| Explode: 0.00                                  |
+| Voice: off                                     |
 | Scale: 1.00x                                   |
 | Model: sculpture.obj                           |
 | Faces: 12,000                                  |
@@ -77,7 +79,13 @@ make the interaction pipeline and its engineering tradeoffs inspectable in code.
 | Mesh analysis | Volume, area, extents, centre of mass, watertight, winding | `compute_metrics` |
 | PLA estimate | Density assumption 1.24 g/cm3 | `compute_metrics` |
 | STL export | Timestamped STL; rotation and scale, no screen pan | `export_transformed_mesh` |
-| CLI | `python -m src.main [--model PATH] [--frame-skip N]` | `src/main.py` |
+| Audio cues | Synthesized 44.1 kHz cues; silent fallback; `v` mute | `audio_feedback.py` |
+| Voice commands | Optional `--voice`; five-command whitelist with debounce | `voice_commands.py` |
+| Exploded view | EMA eased, normal displacement; visualization only | `src/main.py` |
+| Measurement | Vertex picking within 12 px; base-geometry distance | `vertex_measure.py` |
+| Telemetry | JSONL records, 150-frame flush, synchronous writes | `telemetry.py` |
+| Config | CLI overrides local config; invalid settings fall back | `config.py` |
+| CLI | `python -m src.main [--model PATH] [--frame-skip N] [--voice]` | `src/main.py` |
 
 ## Architecture
 
@@ -154,12 +162,21 @@ targets 5000, 2500, 1200, and 600, moving one rung when mean edge length crosses
 | Move two palms apart/together | Scale model | Scale is clamped between 0.5x and 3.0x |
 | Move two palms together | Pan model | Two-hand mode has enter/exit hysteresis |
 | Arrow keys | Rotate model | 5 degrees per key press |
-| `+` / `-` | Change scale | 0.1 per press |
+| `+` / `=` / `-` | Change scale | 0.1 per press |
 | `r` | Reset pose | Rotation, scale, and pan return to defaults |
-| `a` | Toggle analysis panel | Requires a mesh loaded with `--model` |
-| `e` | Export transformed mesh | Requires `--model`; writes an STL in `output/` |
+| `a` | Toggle analysis panel | Mesh metrics require a model loaded with `--model` |
+| `e` | Export transformed mesh | Writes an STL; explode displacement is excluded |
+| `x` | Toggle exploded view | Visual displacement is excluded from STL export |
+| `m` | Clear measurements | A pinched highlighted vertex starts a measurement |
+| `l` | Toggle telemetry | JSONL session saved in `output/` |
+| `c` | Write current tuning values | Creates ignored local `config.json` |
+| `v` | Mute or unmute audio | Audio failure degrades to silence |
+| Voice | Analyze, export, reset, explode, quit | Enable with `--voice`; HUD shows last command or off |
 | `q` | Quit | Closes the camera window |
 | `--frame-skip N` | Inference cadence | Run every N frames; minimum is 1 |
+
+Tuning values load from `config.json`; command-line tuning flags take priority.
+See [config.example.json](config.example.json) for the available values.
 
 ## Quick Start
 
@@ -224,6 +241,9 @@ The webcam is used for interaction only; it is never used to capture the scan.
 
 ## Performance and Testing
 
+Run the headless synthetic benchmark with `python scripts/benchmark.py`.
+See [docs/BENCHMARK.md](docs/BENCHMARK.md) and the [two-minute demo script](DEMO_SCRIPT.md).
+
 Measured on the project reference setup: approximately 35 FPS at 640x480;
 inference EMA of 12–23 ms with `--frame-skip 2`; rendering around 5.5 ms.
 Results vary with hardware, camera, model complexity, and lighting.
@@ -236,7 +256,10 @@ visibility regression guard.
 .venv\Scripts\python.exe -m pytest tests/
 ```
 
-The current collection contains 76 tests.
+The current collection contains 87 tests.
+
+Generate the six headless states under `output/stills/` with
+`python scripts/capture_stills.py`.
 
 ## Known Limitations
 
@@ -257,11 +280,13 @@ The current collection contains 76 tests.
 | `v0.2.0` | Interaction engine |
 | `v0.3.0` | Mesh pipeline |
 | `v0.4.0` | Analysis and export |
+| `v1.0.0` | Runtime release and complete phase status |
+| `v1.1.0` | Audio, voice, exploded view, measurements, telemetry, and config |
 
 ### Future work
 
 - VR headset presentation and tracked controller support.
-- Voice commands for common model and interface actions.
+- VR headset presentation and tracked controller support.
 - Multi-user interaction and session coordination.
 
 ## Comparison

@@ -173,6 +173,7 @@ class WireframeRenderer:
         points2d: np.ndarray,
         edges: np.ndarray,
         depth: Optional[np.ndarray] = None,
+        force_lod: Optional[int] = None,
     ) -> np.ndarray:
         """Render the wireframe onto a copy of ``frame``.
 
@@ -205,7 +206,9 @@ class WireframeRenderer:
         # threshold. The metric is computed over the full prepared table so the
         # choice is independent of the level currently drawn, and the ladder is
         # built once from that same table.
-        active_edges, active_count, mean_length = self._select_lod_level(points2d, edges)
+        active_edges, active_count, mean_length = self._select_lod_level(
+            points2d, edges, force_lod
+        )
         self.active_edge_count = active_count
         self.mean_edge_length = mean_length
 
@@ -307,7 +310,8 @@ class WireframeRenderer:
         return drawing
 
     def _select_lod_level(
-        self, points2d: np.ndarray, edges: np.ndarray
+        self, points2d: np.ndarray, edges: np.ndarray,
+        force_lod: Optional[int] = None,
     ) -> Tuple[np.ndarray, int, float]:
         """Pick the LOD level for ``edges`` and return its table, size and mean pixel length.
 
@@ -338,7 +342,12 @@ class WireframeRenderer:
 
         mean_length = _mean_projected_length(points2d, edges)
         levels = len(self._ladder_edges)
-        if mean_length > LOD_UPGRADE_PX and self._lod_index > 0:
+        if force_lod is not None:
+            self._lod_index = min(
+                range(levels),
+                key=lambda index: abs(self._ladder_edges[index].shape[0] - force_lod),
+            )
+        elif mean_length > LOD_UPGRADE_PX and self._lod_index > 0:
             self._lod_index -= 1
         elif mean_length < LOD_DOWNGRADE_PX and self._lod_index < levels - 1:
             self._lod_index += 1
