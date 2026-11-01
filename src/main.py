@@ -23,12 +23,15 @@ from src.analysis.model_analyzer import (
     compute_metrics,
     export_transformed_mesh,
     load_and_prepare_mesh,
+    load_prepared_mesh,
     load_source_mesh,
 )
 from src.interaction.gesture_controller import GestureController, Mode
+from src.interaction.voice_commands import VoiceLayer
 from src.rendering.projection_3d import MIN_Z, Z_OFFSET, make_cube, project_points, rotation_matrix
 from src.rendering.wireframe_renderer import WireframeRenderer
 from src.utils.helpers import setup_logging
+from src.utils.audio_feedback import SoundBoard
 from src.vision.hand_tracker import GrabDetector, HandTracker, Smoother
 
 __all__ = ["main"]
@@ -202,6 +205,8 @@ def build_hud(
     lod_mean_len: float = 0.0,
     analysis_metrics: Optional[dict] = None,
     analysis_visible: bool = False,
+    explode_f: float = 0.0,
+    voice_status: str = "off",
 ) -> Tuple[List[str], List[tuple[int, int, int]]]:
     """Assemble the HUD status lines and their per-line colours.
 
@@ -301,6 +306,8 @@ def build_hud(
     colors.append(HUD_MODEL_COUNT_COLOR)
     lines.append(f"LOD: {lod_edges} @ {lod_mean_len:.1f}px")
     colors.append(HUD_MODEL_COUNT_COLOR)
+    lines.extend((f"Explode: {explode_f:.2f}", f"Voice: {voice_status}"))
+    colors.extend((HUD_MODEL_COUNT_COLOR, HUD_MODEL_COUNT_COLOR))
 
     if analysis_visible and analysis_metrics is not None:
         volume = analysis_metrics["volume"]
@@ -418,14 +425,22 @@ def _render_stage(
     model_vertices: np.ndarray,
     model_edges: np.ndarray,
     controller: GestureController,
+    explode_f: float = 0.0,
+    explode_offset: Optional[np.ndarray] = None,
+    displaced_vertices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Project and draw the model for one frame, without UI operations."""
     rot = rotation_matrix(controller.rot_x, controller.rot_y, 0.0)
-    transformed = (model_vertices @ rot.T) * controller.scale
+    source = model_vertices
+    if explode_offset is not None and displaced_vertices is not None:
+        np.multiply(explode_offset, explode_f, out=displaced_vertices)
+        np.add(model_vertices, displaced_vertices, out=displaced_vertices)
+        source = displaced_vertices
+    transformed = (source @ rot.T) * controller.scale
     depth = transformed[:, 2] + Z_OFFSET
     depth = np.where(depth < MIN_Z, MIN_Z, depth)
     points2d = project_points(
-        model_vertices,
+        source,
         rot,
         controller.scale,
         tuple(controller.offset),
@@ -435,11 +450,13 @@ def _render_stage(
     return renderer.draw(frame, points2d, model_edges, depth=depth)
 
 
-def run_loop(
+def _run_loop(
     capture: cv2.VideoCapture,
     tracker: HandTracker,
     model_path: Optional[str] = None,
     frame_skip: int = 1,
+    soundboard: Optional[SoundBoard] = None,
+    voice: Optional[VoiceLayer] = None,
 ) -> int:
     """Process frames until the user presses the exit key.
 
@@ -481,12 +498,38 @@ def run_loop(
     cached_hands = None
 
     # Model, renderer and controller are allocated once, outside the hot loop.
-    model_vertices, model_edges, model_name, face_count, edge_count = _load_model(model_path)
+    prepared_mesh = None
+    try:
+        if model_path is None:
+            model_vertices, model_edges = make_cube()
+            model_name, face_count = "cube", 0
+        else:
+            prepared_mesh, model_edges, face_count = load_prepared_mesh(model_path)
+            model_vertices = np.asarray(prepared_mesh.vertices)
+            model_name = os.path.basename(model_path)
+        edge_count = model_edges.shape[0]
+    except Exception as exc:
+        logger.warning("Could not prepare model: %s; using default cube", exc)
+        model_vertices, model_edges, model_name, face_count, edge_count = _load_model(None)
     model_mesh = load_source_mesh(model_path) if model_path is not None else None
     analysis_metrics = compute_metrics(model_mesh) if model_mesh is not None else None
+    if model_path is not None and face_count == 0 and soundboard is not None:
+        soundboard.play("error")
     renderer = WireframeRenderer(holographic=model_path is not None)
     renderer.prepare_lod(model_edges)
     controller = GestureController()
+    # Exploded geometry is a render-only displacement; exports use the source mesh.
+    if prepared_mesh is not None:
+        normals = np.asarray(prepared_mesh.vertex_normals, dtype=np.float64)
+    else:
+        radial = model_vertices - model_vertices.mean(axis=0)
+        lengths = np.linalg.norm(radial, axis=1)
+        normals = np.divide(radial, lengths[:, None], out=np.zeros_like(radial),
+                             where=lengths[:, None] > 0)
+    explode_offset = normals * 40.0
+    displaced_vertices = np.empty_like(model_vertices)
+    explode_target = 0.0
+    explode_f = 0.0
     analysis_visible = False
     exported_message: Optional[str] = None
     exported_message_until = 0.0
@@ -523,16 +566,37 @@ def run_loop(
 
         # Render stage: projection plus the wireframe pass.
         t0 = time.perf_counter()
-        overlay = _render_stage(overlay, renderer, model_vertices, model_edges, controller)
+        explode_f += 0.15 * (explode_target - explode_f)
+        overlay = _render_stage(
+            overlay, renderer, model_vertices, model_edges, controller,
+            explode_f, explode_offset, displaced_vertices,
+        )
         render_ema = RENDER_SMOOTHING * render_ema + (1 - RENDER_SMOOTHING) * (
             time.perf_counter() - t0
         ) * 1000.0
 
         key = cv2.waitKey(1) & 0xFF
+        voice_commands = voice.drain() if voice is not None else []
+        for command in voice_commands:
+            if command == "analyze":
+                analysis_visible = not analysis_visible
+            elif command == "export":
+                key = ord("e")
+            elif command == "reset":
+                controller.reset()
+            elif command == "explode":
+                explode_target = 0.0 if explode_target else 1.0
+            elif command == "quit":
+                key = EXIT_KEY
+        was_grabbed = grab_detector.is_grabbed
         if key == EXIT_KEY:
             logger.info("User requested exit")
             break
-        if key == ord("a"):
+        if key == ord("x"):
+            explode_target = 0.0 if explode_target else 1.0
+        elif key == ord("v") and soundboard is not None:
+            soundboard.toggle_mute()
+        elif key == ord("a"):
             analysis_visible = not analysis_visible
         elif key == ord("e"):
             if model_mesh is None:
@@ -548,6 +612,8 @@ def run_loop(
                 )
                 exported_message = f"Exported: {export_path.name}"
                 exported_message_until = time.monotonic() + 2.0
+                if soundboard is not None:
+                    soundboard.play("export")
         else:
             apply_keyboard(key, controller)
 
@@ -565,6 +631,8 @@ def run_loop(
         if hands is not None:
             pinch_ratio = tracker.get_pinch_ratio(hands[0])
             grab_detector.update(pinch_ratio)
+            if soundboard is not None and grab_detector.is_grabbed != was_grabbed:
+                soundboard.play("grab" if grab_detector.is_grabbed else "release")
             palm_center = tracker.get_palm_center(hands[0])
             smoothed_palm = (
                 palm_x_smoother.update(palm_center[0]),
@@ -591,6 +659,8 @@ def run_loop(
                 lod_mean_len=renderer.mean_edge_length,
                 analysis_metrics=analysis_metrics,
                 analysis_visible=analysis_visible,
+                explode_f=explode_f,
+                voice_status=voice.status if voice is not None else "off",
             )
         else:
             # No hand: the detectors keep their last value so a hand that
@@ -614,6 +684,8 @@ def run_loop(
                 lod_mean_len=renderer.mean_edge_length,
                 analysis_metrics=analysis_metrics,
                 analysis_visible=analysis_visible,
+                explode_f=explode_f,
+                voice_status=voice.status if voice is not None else "off",
             )
 
         if exported_message and time.monotonic() < exported_message_until:
@@ -627,6 +699,23 @@ def run_loop(
         frame_index += 1
 
     return 0
+
+
+def run_loop(
+    capture: cv2.VideoCapture,
+    tracker: HandTracker,
+    model_path: Optional[str] = None,
+    frame_skip: int = 1,
+    voice_enabled: bool = False,
+) -> int:
+    """Run interaction and close optional audio and voice resources."""
+    soundboard = SoundBoard()
+    voice = VoiceLayer(enabled=voice_enabled)
+    try:
+        return _run_loop(capture, tracker, model_path, frame_skip, soundboard, voice)
+    finally:
+        voice.stop()
+        soundboard.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -661,6 +750,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Run hand inference every N frames (default: 1).",
     )
+    parser.add_argument("--voice", action="store_true", help="Enable optional voice commands.")
     args = parser.parse_args(argv)
     if args.frame_skip < 1:
         parser.error("--frame-skip must be at least 1")
@@ -679,7 +769,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         capture = open_webcam()
         tracker = HandTracker()
         logger.info("Hand landmarker and camera stream online")
-        return run_loop(capture, tracker, model_path=args.model, frame_skip=args.frame_skip)
+        return run_loop(
+            capture, tracker, model_path=args.model, frame_skip=args.frame_skip,
+            voice_enabled=args.voice,
+        )
     except (FileNotFoundError, RuntimeError) as exc:
         logger.error("%s", exc)
         return 1

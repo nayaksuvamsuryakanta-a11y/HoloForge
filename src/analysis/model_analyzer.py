@@ -26,6 +26,7 @@ from src.rendering.projection_3d import make_cube, rotation_matrix
 __all__ = [
     "DENSITY_G_CM3",
     "load_and_prepare_mesh",
+    "load_prepared_mesh",
     "load_source_mesh",
     "mesh_face_count",
     "compute_metrics",
@@ -305,6 +306,24 @@ def load_and_prepare_mesh(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
     )
 
     return _normalise_to_box(mesh.vertices, mesh), edges, original_face_count
+
+
+def load_prepared_mesh(filepath: str):
+    """Return the centred runtime mesh, its edge subset, and original face count."""
+    if trimesh is None:
+        raise RuntimeError("trimesh is not installed")
+    raw = trimesh.load(str(filepath), force="mesh")
+    mesh = _flatten_scene(raw)
+    if mesh is None:
+        raise ValueError(f"{filepath!r} contains no usable mesh")
+    original_face_count = len(mesh.faces)
+    mesh = _prepare(mesh)
+    decimated = _decimate(mesh, DECIMATION_TARGET)
+    if decimated is not None:
+        mesh = decimated
+    edges = _subsample_edges(mesh, MAX_EDGES)
+    mesh.vertices = _normalise_to_box(mesh.vertices, mesh)
+    return mesh, edges, original_face_count
 
 
 def mesh_face_count(filepath: str) -> int:
