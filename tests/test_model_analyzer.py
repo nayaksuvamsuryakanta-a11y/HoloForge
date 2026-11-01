@@ -21,7 +21,13 @@ import numpy as np
 import pytest
 import trimesh
 
-from src.analysis.model_analyzer import MAX_EDGES, load_and_prepare_mesh, mesh_face_count
+from src.analysis.model_analyzer import (
+    MAX_EDGES,
+    compute_metrics,
+    export_transformed_mesh,
+    load_and_prepare_mesh,
+    mesh_face_count,
+)
 from src.rendering.projection_3d import make_cube
 
 SUBDIVISIONS = 4  # icosphere: 20 * 4**4 == 5120 faces
@@ -172,3 +178,32 @@ class TestMeshFaceCount:
 
         with mock.patch.object(analyzer, "trimesh", None):
             assert mesh_face_count(temp_path("does-not-exist.obj")) == 0
+
+
+class TestMeshMetricsAndExport:
+    def test_box_metrics_are_exact(self) -> None:
+        metrics = compute_metrics(trimesh.creation.box(extents=(1.0, 2.0, 3.0)))
+        assert metrics["volume"] == pytest.approx(6.0)
+        assert metrics["surface_area"] == pytest.approx(22.0)
+        assert np.array_equal(metrics["extents"], np.array([1.0, 2.0, 3.0]))
+        assert np.allclose(metrics["center_mass"], (0.0, 0.0, 0.0))
+        assert metrics["is_watertight"] is True
+        assert metrics["is_winding_consistent"] is True
+        assert metrics["vertex_count"] == 8
+        assert metrics["face_count"] == 12
+        assert metrics["estimated_mass_g"] == pytest.approx(6.0 * 1.24 / 1000.0)
+
+    def test_open_mesh_has_no_volume(self) -> None:
+        mesh = trimesh.creation.box()
+        mesh.update_faces(np.arange(len(mesh.faces)) != 0)
+        metrics = compute_metrics(mesh)
+        assert metrics["is_watertight"] is False
+        assert metrics["volume"] is None
+        assert metrics["estimated_mass_g"] is None
+
+    def test_exported_y_rotation_swaps_mesh_extents(self) -> None:
+        mesh = trimesh.creation.box(extents=(1.0, 2.0, 3.0))
+        with tempfile.TemporaryDirectory() as output_dir:
+            path = export_transformed_mesh(mesh, 0.0, np.pi / 2.0, 1.0, output_dir)
+            reloaded = trimesh.load(path, force="mesh")
+        assert np.allclose(reloaded.bounding_box.extents, (3.0, 2.0, 1.0), atol=1e-6)

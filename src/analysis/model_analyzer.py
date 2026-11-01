@@ -15,13 +15,23 @@ the landmark detection pipeline.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 
-from src.rendering.projection_3d import make_cube
+from src.rendering.projection_3d import make_cube, rotation_matrix
 
-__all__ = ["load_and_prepare_mesh", "mesh_face_count", "ModelAnalyzer"]
+__all__ = [
+    "DENSITY_G_CM3",
+    "load_and_prepare_mesh",
+    "load_source_mesh",
+    "mesh_face_count",
+    "compute_metrics",
+    "export_transformed_mesh",
+    "ModelAnalyzer",
+]
 
 logger = logging.getLogger("HoloForge")
 
@@ -32,6 +42,7 @@ TARGET_BOX_SIZE = 150.0       # model-space span, matching make_cube()
 SEED = 42                     # reproducible edge subsampling
 # trimesh renamed the decimation kwarg across releases; try each spelling.
 DECIMATION_KWARGS = ("face_count", "target_face_count")
+DENSITY_G_CM3 = 1.24  # PLA density; mesh dimensions are assumed to be mm.
 
 # Trimesh is a declared dependency but may be missing in a minimal install.
 try:
@@ -324,6 +335,65 @@ def mesh_face_count(filepath: str) -> int:
     if not isinstance(mesh, trimesh.Trimesh):
         return 0
     return int(len(mesh.faces))
+
+
+def load_source_mesh(filepath: str):
+    """Load and flatten the original mesh for analysis and STL export."""
+    if trimesh is None:
+        raise RuntimeError("trimesh is not installed")
+    raw = trimesh.load(str(filepath), force="mesh")
+    mesh = _flatten_scene(raw)
+    if mesh is None:
+        raise ValueError(f"{filepath!r} contains no usable mesh")
+    return mesh
+
+
+def compute_metrics(mesh: "trimesh.Trimesh") -> dict:
+    """Return geometry, topology, and PLA print-mass estimates for a mesh.
+
+    Volume and mass use the mesh's coordinate units as millimetres. Surface
+    area and extents are returned in the mesh's units and square units.
+    """
+    watertight = bool(mesh.is_watertight)
+    volume_mm3 = abs(float(mesh.volume)) if watertight else None
+    return {
+        "volume": volume_mm3,
+        "surface_area": float(mesh.area),
+        "extents": np.asarray(mesh.bounding_box.extents, dtype=np.float64),
+        "center_mass": np.asarray(mesh.center_mass, dtype=np.float64),
+        "is_watertight": watertight,
+        "is_winding_consistent": bool(mesh.is_winding_consistent),
+        "vertex_count": int(len(mesh.vertices)),
+        "face_count": int(len(mesh.faces)),
+        "estimated_mass_g": (
+            volume_mm3 * DENSITY_G_CM3 / 1000.0 if volume_mm3 is not None else None
+        ),
+    }
+
+
+def export_transformed_mesh(
+    mesh: "trimesh.Trimesh",
+    rot_x: float,
+    rot_y: float,
+    scale: float,
+    out_dir: str | Path,
+) -> Path:
+    """Export a transformed mesh as a timestamped STL and return its path.
+
+    The controller's screen-space pan is intentionally ignored: pan changes
+    the view placement, while this export applies object rotation and scale.
+    """
+    transformed = mesh.copy()
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation_matrix(rot_x, rot_y, 0.0) * float(scale)
+    transformed.apply_transform(matrix)
+    output_dir = Path(out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = output_dir / f"holoforge_{timestamp}.stl"
+    transformed.export(output_path, file_type="stl")
+    logger.info("Exported transformed mesh to %s", output_path)
+    return output_path
 
 
 # Analysis ----------------------------------------------------------------

@@ -19,7 +19,12 @@ from typing import List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from src.analysis.model_analyzer import load_and_prepare_mesh
+from src.analysis.model_analyzer import (
+    compute_metrics,
+    export_transformed_mesh,
+    load_and_prepare_mesh,
+    load_source_mesh,
+)
 from src.interaction.gesture_controller import GestureController, Mode
 from src.rendering.projection_3d import MIN_Z, Z_OFFSET, make_cube, project_points, rotation_matrix
 from src.rendering.wireframe_renderer import WireframeRenderer
@@ -195,6 +200,8 @@ def build_hud(
     edge_count: int,
     lod_edges: int = 0,
     lod_mean_len: float = 0.0,
+    analysis_metrics: Optional[dict] = None,
+    analysis_visible: bool = False,
 ) -> Tuple[List[str], List[tuple[int, int, int]]]:
     """Assemble the HUD status lines and their per-line colours.
 
@@ -294,6 +301,27 @@ def build_hud(
     colors.append(HUD_MODEL_COUNT_COLOR)
     lines.append(f"LOD: {lod_edges} @ {lod_mean_len:.1f}px")
     colors.append(HUD_MODEL_COUNT_COLOR)
+
+    if analysis_visible and analysis_metrics is not None:
+        volume = analysis_metrics["volume"]
+        lines.append(
+            "Volume: N/A (open mesh)" if volume is None else f"Volume: {volume:.2f} mm³"
+        )
+        colors.append(HUD_MODEL_COUNT_COLOR)
+        lines.append(f"Surface Area: {analysis_metrics['surface_area']:.2f} mm²")
+        colors.append(HUD_MODEL_COUNT_COLOR)
+        x_size, y_size, z_size = analysis_metrics["extents"]
+        lines.append(f"Dimensions (X, Y, Z): {x_size:.2f}, {y_size:.2f}, {z_size:.2f} mm")
+        colors.append(HUD_MODEL_COUNT_COLOR)
+        watertight = analysis_metrics["is_watertight"]
+        lines.append(f"Watertight: {'YES' if watertight else 'NO'}")
+        colors.append(HUD_MODEL_COUNT_COLOR if watertight else HUD_STATE_GRAB_COLOR)
+        winding = analysis_metrics["is_winding_consistent"]
+        lines.append(f"Winding: {'OK' if winding else 'FAIL'}")
+        colors.append(HUD_MODEL_COUNT_COLOR)
+        mass = analysis_metrics["estimated_mass_g"]
+        lines.append("Estimated PLA mass: N/A" if mass is None else f"Estimated PLA mass: {mass:.2f} g")
+        colors.append(HUD_MODEL_COUNT_COLOR)
 
     return lines, colors
 
@@ -454,9 +482,14 @@ def run_loop(
 
     # Model, renderer and controller are allocated once, outside the hot loop.
     model_vertices, model_edges, model_name, face_count, edge_count = _load_model(model_path)
+    model_mesh = load_source_mesh(model_path) if model_path is not None else None
+    analysis_metrics = compute_metrics(model_mesh) if model_mesh is not None else None
     renderer = WireframeRenderer(holographic=model_path is not None)
     renderer.prepare_lod(model_edges)
     controller = GestureController()
+    analysis_visible = False
+    exported_message: Optional[str] = None
+    exported_message_until = 0.0
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     logger.info("Hand-tracking loop running on camera; press '%s' to exit", chr(EXIT_KEY))
@@ -499,7 +532,24 @@ def run_loop(
         if key == EXIT_KEY:
             logger.info("User requested exit")
             break
-        apply_keyboard(key, controller)
+        if key == ord("a"):
+            analysis_visible = not analysis_visible
+        elif key == ord("e"):
+            if model_mesh is None:
+                logger.info("Export requires --model")
+                exported_message = None
+            else:
+                export_path = export_transformed_mesh(
+                    model_mesh,
+                    controller.rot_x,
+                    controller.rot_y,
+                    controller.scale,
+                    "output",
+                )
+                exported_message = f"Exported: {export_path.name}"
+                exported_message_until = time.monotonic() + 2.0
+        else:
+            apply_keyboard(key, controller)
 
         # Stage latencies are logged on a separate cadence from the FPS so the
         # console is not flooded by a per-frame number.
@@ -539,6 +589,8 @@ def run_loop(
                 edge_count=edge_count,
                 lod_edges=renderer.active_edge_count,
                 lod_mean_len=renderer.mean_edge_length,
+                analysis_metrics=analysis_metrics,
+                analysis_visible=analysis_visible,
             )
         else:
             # No hand: the detectors keep their last value so a hand that
@@ -560,7 +612,15 @@ def run_loop(
                 edge_count=edge_count,
                 lod_edges=renderer.active_edge_count,
                 lod_mean_len=renderer.mean_edge_length,
+                analysis_metrics=analysis_metrics,
+                analysis_visible=analysis_visible,
             )
+
+        if exported_message and time.monotonic() < exported_message_until:
+            lines.append(exported_message)
+            colors.append(HUD_MODEL_NAME_COLOR)
+        elif time.monotonic() >= exported_message_until:
+            exported_message = None
 
         draw_hud(overlay, lines, colors)
         cv2.imshow(WINDOW_NAME, overlay)

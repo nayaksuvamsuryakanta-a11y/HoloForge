@@ -209,9 +209,9 @@ class WireframeRenderer:
         self.active_edge_count = active_count
         self.mean_edge_length = mean_length
 
-        # Reshape to (-1, 1, 2) so polylines draws each edge as its own
-        # disconnected polyline instead of joining them into one chain.
-        polylines = points2d[active_edges].reshape(-1, 1, 2).astype(np.int32)
+        # Keep each edge as a separate two-point contour. Flattening to
+        # (-1, 1, 2) gives OpenCV one-point contours, so no line is drawn.
+        polylines = points2d[active_edges].reshape(-1, 2, 1, 2).astype(np.int32)
 
         if depth is None or not self.holographic:
             cv2.polylines(
@@ -288,7 +288,7 @@ class WireframeRenderer:
         ):
             if not np.any(mask):
                 continue
-            bin_polylines = points2d[active_edges[mask]].reshape(-1, 1, 2).astype(np.int32)
+            bin_polylines = points2d[active_edges[mask]].reshape(-1, 2, 1, 2).astype(np.int32)
             cv2.polylines(
                 drawing,
                 bin_polylines,
