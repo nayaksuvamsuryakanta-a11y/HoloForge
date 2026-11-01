@@ -370,6 +370,43 @@ def _load_model(model_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, str,
     return vertices, edges, display_name, face_count, edges.shape[0]
 
 
+def _inference_stage(
+    tracker: HandTracker,
+    frame: np.ndarray,
+    timestamp_ms: int,
+    frame_index: int,
+    frame_skip: int,
+    cached_hands,
+):
+    """Run or reuse hand detection for one frame."""
+    if frame_index % frame_skip == 0:
+        cached_hands = tracker.detect(frame, timestamp_ms)
+    return cached_hands, cached_hands
+
+
+def _render_stage(
+    frame: np.ndarray,
+    renderer: WireframeRenderer,
+    model_vertices: np.ndarray,
+    model_edges: np.ndarray,
+    controller: GestureController,
+) -> np.ndarray:
+    """Project and draw the model for one frame, without UI operations."""
+    rot = rotation_matrix(controller.rot_x, controller.rot_y, 0.0)
+    transformed = (model_vertices @ rot.T) * controller.scale
+    depth = transformed[:, 2] + Z_OFFSET
+    depth = np.where(depth < MIN_Z, MIN_Z, depth)
+    points2d = project_points(
+        model_vertices,
+        rot,
+        controller.scale,
+        tuple(controller.offset),
+        frame.shape,
+        transformed,
+    )
+    return renderer.draw(frame, points2d, model_edges, depth=depth)
+
+
 def run_loop(
     capture: cv2.VideoCapture,
     tracker: HandTracker,
@@ -418,6 +455,7 @@ def run_loop(
     # Model, renderer and controller are allocated once, outside the hot loop.
     model_vertices, model_edges, model_name, face_count, edge_count = _load_model(model_path)
     renderer = WireframeRenderer(holographic=model_path is not None)
+    renderer.prepare_lod(model_edges)
     controller = GestureController()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
@@ -441,11 +479,9 @@ def run_loop(
         # Inference stage: the landmarker. On a skipped frame the previous detection
         # is reused, so the EMA genuinely records the work saved by frame skip.
         t0 = time.perf_counter()
-        if frame_index % frame_skip == 0:
-            hands = tracker.detect(frame, timestamp_ms)
-            cached_hands = hands
-        else:
-            hands = cached_hands
+        hands, cached_hands = _inference_stage(
+            tracker, frame, timestamp_ms, frame_index, frame_skip, cached_hands
+        )
         inference_ema = INFERENCE_SMOOTHING * inference_ema + (1 - INFERENCE_SMOOTHING) * (
             time.perf_counter() - t0
         ) * 1000.0
@@ -454,19 +490,7 @@ def run_loop(
 
         # Render stage: projection plus the wireframe pass.
         t0 = time.perf_counter()
-        rot = rotation_matrix(controller.rot_x, controller.rot_y, 0.0)
-        transformed = (model_vertices @ rot.T) * controller.scale
-        depth = transformed[:, 2] + Z_OFFSET
-        depth = np.where(depth < MIN_Z, MIN_Z, depth)
-        points2d = project_points(
-            model_vertices,
-            rot,
-            controller.scale,
-            tuple(controller.offset),
-            frame.shape,
-            transformed,
-        )
-        overlay = renderer.draw(overlay, points2d, model_edges, depth=depth)
+        overlay = _render_stage(overlay, renderer, model_vertices, model_edges, controller)
         render_ema = RENDER_SMOOTHING * render_ema + (1 - RENDER_SMOOTHING) * (
             time.perf_counter() - t0
         ) * 1000.0
@@ -540,6 +564,7 @@ def run_loop(
 
         draw_hud(overlay, lines, colors)
         cv2.imshow(WINDOW_NAME, overlay)
+        frame_index += 1
 
     return 0
 
@@ -569,7 +594,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "the default cube. Large scans are decimated to a few thousand "
              "edges automatically.",
     )
+    parser.add_argument(
+        "--frame-skip",
+        metavar="N",
+        type=int,
+        default=1,
+        help="Run hand inference every N frames (default: 1).",
+    )
     args = parser.parse_args(argv)
+    if args.frame_skip < 1:
+        parser.error("--frame-skip must be at least 1")
 
     setup_logging()
     logger = logging.getLogger("HoloForge")
@@ -585,7 +619,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         capture = open_webcam()
         tracker = HandTracker()
         logger.info("Hand landmarker and camera stream online")
-        return run_loop(capture, tracker, model_path=args.model)
+        return run_loop(capture, tracker, model_path=args.model, frame_skip=args.frame_skip)
     except (FileNotFoundError, RuntimeError) as exc:
         logger.error("%s", exc)
         return 1

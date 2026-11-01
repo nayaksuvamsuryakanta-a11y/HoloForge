@@ -40,6 +40,7 @@ __all__ = [
     "LOD_TARGETS",
     "LOD_UPGRADE_PX",
     "LOD_DOWNGRADE_PX",
+    "stroke_rules",
     "WireframeRenderer",
 ]
 
@@ -68,6 +69,15 @@ LOD_DOWNGRADE_PX = 4.0 # mean projected length below which detail is dropped
 # The stroke rules pivot on these edge counts.
 LOD_GLOW_LIMIT = 1200  # outer glow drawn only at or below this many edges
 LOD_VERTEX_LIMIT = 600 # vertex dots drawn only at or below this many edges
+
+
+def stroke_rules(edge_count: int) -> Tuple[bool, int, bool]:
+    """Return whether glow/dots are enabled and the core stroke width."""
+    return (
+        edge_count <= LOD_GLOW_LIMIT,
+        1 if edge_count > LOD_GLOW_LIMIT else 2,
+        edge_count <= LOD_VERTEX_LIMIT,
+    )
 
 # Depth bins are computed from the frame's own depth distribution, so they
 # track the model as it moves rather than being hardcoded to one pose.
@@ -146,10 +156,16 @@ class WireframeRenderer:
 
         # LOD state; the ladder is built from the first edge table seen.
         self._ladder_edges: Optional[Sequence[np.ndarray]] = None
+        self._ladder_indices: Optional[Sequence[np.ndarray]] = None
         self._lod_index = 0
         # Exposed for the HUD; 0 until the first frame has been rendered.
         self.active_edge_count = 0
         self.mean_edge_length = 0.0
+
+    def prepare_lod(self, edges: np.ndarray) -> None:
+        """Precompute deterministic nested edge indices and tables once."""
+        self._ladder_indices, self._ladder_edges = build_ladder(edges)
+        self._lod_index = 0
 
     def draw(
         self,
@@ -206,7 +222,8 @@ class WireframeRenderer:
                 thickness=self.thickness,
                 lineType=cv2.LINE_AA,
             )
-            self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
+            if stroke_rules(active_count)[2]:
+                self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
             return drawing
 
         depth = np.asarray(depth, dtype=np.float64)
@@ -225,7 +242,8 @@ class WireframeRenderer:
                 thickness=self.thickness,
                 lineType=cv2.LINE_AA,
             )
-            self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
+            if stroke_rules(active_count)[2]:
+                self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
             return drawing
 
         # Each edge's depth is the mean of its two endpoints, then binned by
@@ -242,14 +260,16 @@ class WireframeRenderer:
                 thickness=self.thickness,
                 lineType=cv2.LINE_AA,
             )
-            self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
+            if stroke_rules(active_count)[2]:
+                self._draw_vertex_dots(drawing, points2d, np.arange(points2d.shape[0]))
             return drawing
 
         far_bound, near_bound = np.percentile(edge_depth, [33.3, 66.7])
 
         # Pass 1: outer glow, only when the silhouette is sparse enough that
         # extra strokes do not saturate into a solid blob.
-        if active_count <= LOD_GLOW_LIMIT:
+        glow_enabled, core_thickness, dots_enabled = stroke_rules(active_count)
+        if glow_enabled:
             cv2.polylines(
                 drawing,
                 polylines,
@@ -261,7 +281,6 @@ class WireframeRenderer:
 
         # Pass 2: depth-cued core, one call per bin. Thinner strokes at high
         # density, thicker once the edges have been thinned.
-        core_thickness = 1 if active_count > LOD_GLOW_LIMIT else 2
         for mask, color in (
             (edge_depth < far_bound, HOLO_FAR),
             ((edge_depth >= far_bound) & (edge_depth < near_bound), HOLO_MID),
@@ -280,7 +299,7 @@ class WireframeRenderer:
             )
 
         # Vertex dots only for the nearest bin, and only at the lowest density.
-        if active_count <= LOD_VERTEX_LIMIT:
+        if dots_enabled:
             near_indices = active_edges[(edge_depth >= near_bound).nonzero()[0]].ravel()
             if near_indices.size > 0:
                 self._draw_vertex_dots(drawing, points2d, np.unique(near_indices))
@@ -315,8 +334,7 @@ class WireframeRenderer:
             table so the metric does not depend on the selected level.
         """
         if self._ladder_edges is None:
-            _, self._ladder_edges = build_ladder(edges)
-            self._lod_index = 0
+            self.prepare_lod(edges)
 
         mean_length = _mean_projected_length(points2d, edges)
         levels = len(self._ladder_edges)
