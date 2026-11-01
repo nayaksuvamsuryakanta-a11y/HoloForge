@@ -4,3 +4,4 @@ mediapipe==0.10.21
 trimesh>=4.0.0
 pygame>=2.5.0
 SpeechRecognition>=3.10.0fast-simplification>=0.1.9
+fast-simplification>=0.1.9
